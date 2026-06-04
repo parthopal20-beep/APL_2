@@ -1,0 +1,41 @@
+{
+  "name": "Employee Management System",
+  "short_name": "EMS App",
+  "description": "Comprehensive Employee Attendance, Tracking, and Management System with offline capability.",
+  "start_url": "/",
+  "id": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/app-icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "192x192",
+      "purpose": "any"
+    },
+    {
+      "src": "/app-icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "512x512",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/app-icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "any",
+      "purpose": "any"
+    }
+  ],
+  "categories": ["business", "productivity", "utilities"],
+  "shortcuts": [
+    {
+      "name": "Employee Dashboard",
+      "short_name": "Dashboard",
+      "description": "Open Employee Profile & Attendance console",
+      "url": "/",
+      "icons": [{"src": "/app-icon.svg", "sizes": "192x192"}]
+    }
+  ]
+}

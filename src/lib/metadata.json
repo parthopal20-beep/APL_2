@@ -1,0 +1,10 @@
+{
+  "name": "APL_2 Attendance",
+  "description": "Comprehensive office operations and employee attendance system with GPS tracking and automated salary calculation.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "geolocation"
+  ],
+  "majorCapabilities": []
+}
