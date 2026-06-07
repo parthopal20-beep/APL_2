@@ -269,7 +269,7 @@ export default function LiveMap({ locations, logs = [], employees, selectedEmplo
           });
         })}
 
-        {locations.map((loc) => {
+        {locations.map((loc, idx) => {
           const emp = employees.find(e => e.id === loc.userId);
           const isSelected = loc.userId === selectedEmployeeId;
           const isInactive = loc.status === 'INACTIVE';
@@ -278,7 +278,7 @@ export default function LiveMap({ locations, logs = [], employees, selectedEmplo
           
           return (
             <Marker 
-              key={`live-${loc.userId}`} 
+              key={`live-${loc.userId}-${idx}`} 
               position={[loc.latitude, loc.longitude]}
               icon={createCustomIcon(emp?.name || loc.name, loc.speed || 0, isSelected)}
               zIndexOffset={isSelected ? 1000 : isInactive ? -500 : 0}

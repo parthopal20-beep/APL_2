@@ -1,15 +1,12 @@
-import { supabase, realSupabase, isConfigured, getUseLocalFallback, LocalDB } from '../lib/supabase';
-import { GoogleSheetsService } from './GoogleSheetsService';
-
-const isSupabaseLive = () => isConfigured && !getUseLocalFallback();
+import { supabase, realSupabase, isConfigured } from '../lib/supabase';
+import { socketService } from './SocketService';
 
 export class SupabaseService {
   private static columnCache: { [key: string]: Set<string> } = {};
   private static missingTables: Set<string> = new Set();
-
-  private static isMockMode(table?: string): boolean {
-    return !isConfigured || getUseLocalFallback();
-  }
+  private static listCache: { [key: string]: { data: any, timestamp: number } } = {};
+  private static CACHE_TTL = 3000; // 3 seconds cache for the same query
+  private static subCooldowns: { [key: string]: number } = {};
 
   /**
    * Cleans an object for Supabase:
@@ -154,7 +151,8 @@ export class SupabaseService {
       'onlinecash': 'onlineCash',
       'valuemismatch': 'valueMismatch',
       'totalamount': 'totalAmount',
-      'totalnotes': 'totalNotes'
+      'totalnotes': 'totalNotes',
+      'username': 'userName'
     };
 
     Object.keys(data).forEach(key => {
@@ -174,98 +172,90 @@ export class SupabaseService {
   }
 
   /**
-   * Primary Fetch: Reads data from Supabase.
+   * Primary Fetch: Reads data from Supabase (or CockroachDB via Proxy).
    */
   static async list(table: string, filters?: { column: string; value: any; operator?: string }[], limitValue?: number, order?: { column: string; ascending?: boolean }, retries = 3): Promise<any[]> {
     const tableName = table.toLowerCase();
+    
+    // Cache key based on table and parameters
+    const cacheKey = `list_${tableName}_${JSON.stringify(filters || [])}_${limitValue || 'no_limit'}_${JSON.stringify(order || 'no_order')}`;
+    
+    // EXEMPT users table from caching to ensure login reliability
+    if (tableName !== 'users') {
+      const cached = this.listCache[cacheKey];
+      if (cached && Date.now() - cached.timestamp < this.CACHE_TTL) {
+        return cached.data;
+      }
+    }
+
     if (this.missingTables.has(tableName)) return [];
 
-    // 1. Always check LocalDB first
-    const localData = LocalDB.list(tableName, filters, limitValue, order);
-
-    // 2. If Supabase is configured and NOT in persistent fallback, fetch remote
-    let remoteData: any[] = [];
-    const canFetchSupabase = isConfigured && !getUseLocalFallback() && tableName === 'users';
-
-    if (canFetchSupabase) {
+    // Redirect to CockroachDB for non-user tables
+    if (tableName !== 'users') {
       try {
-        let query = realSupabase.from(tableName).select('*');
+        const response = await fetch('/api/db/' + tableName + '/select', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filters, limit: limitValue, orderBy: order })
+        });
         
-        if (filters) {
-          filters.forEach(f => {
-            const col = f.column.toLowerCase();
-            const op = f.operator || 'eq';
-            if (op === 'eq') query = query.eq(col, f.value);
-            else if (op === 'gte') query = query.gte(col, f.value);
-            else if (op === 'lte') query = query.lte(col, f.value);
-            else if (op === 'contains') query = query.contains(col, f.value);
-            else if (op === 'like') query = query.ilike(col, f.value);
-          });
-        }
-
-        if (order) {
-          query = query.order(order.column.toLowerCase(), { ascending: order.ascending ?? false });
-        }
-
-        if (limitValue) {
-          query = query.limit(limitValue);
-        }
-
-        const { data, error } = await query;
-        if (error) {
-          // If it's a rate limit or restriction, don't crash, just use local
-          const msg = (error.message || '').toLowerCase();
-          if (msg.includes('rate limit') || msg.includes('too many requests') || msg.includes('quota')) {
-            console.warn(`Supabase ${tableName} fetch restricted, using local data only.`);
+        if (!response.ok) {
+          const contentType = response.headers.get("content-type");
+          if (contentType && contentType.includes("application/json")) {
+            const errData = await response.json();
+            throw new Error(errData.error || `Server error ${response.status}`);
           } else {
-            throw error;
+            throw new Error(`Server returned HTML/Non-JSON response (${response.status}). Potential bridge crash.`);
           }
-        } else {
-          remoteData = this.desanitize(data || []);
         }
-      } catch (err: any) {
-        const msg = (err.message || String(err)).toLowerCase();
-        if (retries > 0 && (msg.includes('fetch') || msg.includes('network') || msg.includes('timeout') || err.code === 'fetch_error')) {
-          await new Promise(r => setTimeout(r, 1000 * (4 - retries)));
-          return this.list(table, filters, limitValue, order, retries - 1);
-        }
-        console.error(`Supabase List Error [${table}]:`, err);
+
+        const result = await response.json();
+        if (result.error) throw new Error(result.error);
+        
+        const results = this.desanitize(result.data || []);
+        
+        // Update Cache
+        this.listCache[cacheKey] = { data: results, timestamp: Date.now() };
+        return results;
+      } catch (err) {
+        console.error(`CockroachDB List Error [${table}]:`, err);
+        return [];
       }
     }
 
-    // 3. Merge hybrid data: Supabase data takes priority if IDs match
-    if (remoteData.length === 0) return localData;
-    if (localData.length === 0) return remoteData;
-
-    const merged = [...remoteData];
-    const remoteIdSet = new Set(remoteData.map(d => String(d.id).toLowerCase()));
-
-    localData.forEach(l => {
-      const lId = String(l.id).toLowerCase();
-      if (!remoteIdSet.has(lId)) {
-        merged.push(l);
+    try {
+      let query = supabase.from(tableName).select('*');
+      
+      if (filters) {
+        filters.forEach(f => {
+          const col = f.column.toLowerCase();
+          const op = f.operator || 'eq';
+          if (op === 'eq') query = query.eq(col, f.value);
+          else if (op === 'neq') query = query.neq(col, f.value);
+          else if (op === 'gte') query = query.gte(col, f.value);
+          else if (op === 'lte') query = query.lte(col, f.value);
+          else if (op === 'contains') query = query.contains(col, f.value);
+          else if (op === 'like') query = query.ilike(col, f.value);
+        });
       }
-    });
-    
-    // De-duplicate any straggly ones by ID
-    const finalMap = new Map();
-    merged.forEach(item => {
-      finalMap.set(String(item.id).toLowerCase(), item);
-    });
-    const finalMerged = Array.from(finalMap.values());
 
-    // Re-apply ordering if needed after merge
-    if (order) {
-      const col = order.column;
-      const asc = order.ascending ?? false;
-      finalMerged.sort((a, b) => {
-        if ((a[col] || '') < (b[col] || '')) return asc ? -1 : 1;
-        if ((a[col] || '') > (b[col] || '')) return asc ? 1 : -1;
-        return 0;
-      });
+      if (order) query = query.order(order.column.toLowerCase(), { ascending: order.ascending ?? false });
+      if (limitValue) query = query.limit(limitValue);
+
+      const { data, error } = await query;
+      if (error) throw error;
+
+      const finalResults = this.desanitize(data || []);
+      this.listCache[cacheKey] = { data: finalResults, timestamp: Date.now() };
+      return finalResults;
+    } catch (err: any) {
+      if (retries > 0) {
+        await new Promise(r => setTimeout(r, 500));
+        return this.list(table, filters, limitValue, order, retries - 1);
+      }
+      console.error(`Database List Error [${table}]:`, err);
+      return [];
     }
-
-    return limitValue ? finalMerged.slice(0, limitValue) : finalMerged;
   }
 
   static async resetDatabase(keepAdminId: string) {
@@ -287,41 +277,20 @@ export class SupabaseService {
       'broadcasts'
     ];
 
-    // 1. Wipe LocalDB
-    for (const table of tables) {
-      if (table === 'users') {
-        const users = LocalDB.get('users');
-        const admin = users.find(u => u.id === keepAdminId || u.username === keepAdminId);
-        if (admin) {
-          LocalDB.set('users', [admin]);
-        } else {
-          // If admin not found in list (unlikely), clear but sign out is dangerous here
-          // We'll trust the caller provided valid ID
-          LocalDB.set('users', []);
-        }
-      } else {
-        localStorage.removeItem('db_cockroach_' + table);
-        localStorage.removeItem('db_' + table); // Just in case of old naming
-        window.dispatchEvent(new Event('local_db_update_' + table));
-      }
-    }
-
-    // 2. Try Supabase Wipe (if allowed by RLS)
-    if (isConfigured && !getUseLocalFallback()) {
+    // Try Supabase Wipe
+    if (isConfigured) {
       try {
         for (const table of tables) {
           if (table === 'users') {
             await realSupabase.from('users').delete().neq('id', keepAdminId);
           } else if (['attendance', 'paydays', 'salary_history'].includes(table)) {
-            // Delete all records from bigint-identity primary key tables
             await realSupabase.from(table).delete().gte('id', 0);
           } else {
-            // Delete all records from uuid/text primary key tables
             await realSupabase.from(table).delete().neq('id', '00000000-0000-0000-0000-000000000000');
           }
         }
       } catch (err) {
-        console.warn("Supabase wipe limited by RLS/Permissions, but LocalDB is cleared.", err);
+        console.warn("Supabase wipe limited by RLS/Permissions.", err);
       }
     }
   }
@@ -330,11 +299,30 @@ export class SupabaseService {
     const tableName = table.toLowerCase();
     if (this.missingTables.has(tableName)) return null;
 
-    // 1. Check LocalDB first (quickest)
-    const localItem = LocalDB.getOne(tableName, id);
+    // CockroachDB Bridge
+    if (tableName !== 'users') {
+      try {
+        const response = await fetch('/api/db/' + tableName + '/select', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            filters: [{ column: 'id', value: id }],
+            limit: 1
+          })
+        });
+        const result = await response.json();
+        if (result.error) throw new Error(result.error);
+        
+        const data = result.data?.[0];
+        return data ? this.desanitize(data) : null;
+      } catch (err) {
+        console.error(`CockroachDB GetOne Error [${table}/${id}]:`, err);
+        return null;
+      }
+    }
 
-    // 2. Try Supabase
-    if (isConfigured && !getUseLocalFallback()) {
+    // Try Supabase directly for users
+    if (isConfigured) {
       try {
         const { data, error } = await realSupabase
           .from(tableName)
@@ -344,8 +332,7 @@ export class SupabaseService {
         
         if (error) {
           if (error.code === 'PGRST116') {
-             // Not found in Supabase, return local if available
-             return localItem;
+             return null;
           }
           throw error;
         }
@@ -360,7 +347,7 @@ export class SupabaseService {
       }
     }
 
-    return localItem;
+    return null;
   }
 
   private static handleError(table: string, op: string, err: any): never {
@@ -395,53 +382,60 @@ export class SupabaseService {
     if (this.missingTables.has(tableName)) return null;
 
     try {
-      // Only generate a string ID for 'users' (which uses strings/UUIDs from Auth)
-      // Otherwise let Supabase handle it (for bigint identities or other defaults)
       const payload = { ...data };
       const identityTables = ['attendance', 'paydays', 'salary_history'];
       
       if (identityTables.includes(tableName)) {
-        // Create a unique numeric-safe ID for BIGINT identity tables
-        // providing a manual ID is safe for "GENERATED BY DEFAULT AS IDENTITY" 
-        // and fixes "null value in column id" for tables created without identity sequences.
         if (!payload.id || typeof payload.id === 'string') {
           payload.id = Date.now() + Math.floor(Math.random() * 1000);
         }
       } else if (!payload.id) {
-        // For all other tables with TEXT PRIMARY KEY, generate a string ID if missing
         payload.id = Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
       }
       
-      if (tableName !== 'users') {
-        const payloadToSave = { ...payload };
-        try {
-          if (tableName === 'attendance') {
-            // Include placeholders or ensure all values are robust
-            payloadToSave.status = payloadToSave.status || 'PRESENT';
-          }
-          LocalDB.upsert(tableName, payloadToSave.id, payloadToSave);
-          window.dispatchEvent(new Event(`local_db_update_${tableName}`));
-          
-          const syncTabTypes = ['attendance', 'mismatches', 'ad_hoc_jobs'];
-          if (syncTabTypes.includes(tableName)) {
-            const sheetId = GoogleSheetsService.getStoredSpreadsheetId();
-            const token = GoogleSheetsService.getAccessToken();
-            if (sheetId && token) {
-              console.log(`[Auto-Sheets Sync] Posting new ${tableName} record to Google Sheets in real-time...`);
-              GoogleSheetsService.pushRecordByType(sheetId, tableName, payloadToSave)
-                .then(() => console.log(`[Auto-Sheets Sync] ${tableName} sheet synchronized successfully.`))
-                .catch(err => console.error(`[Auto-Sheets Sync] Error during real-time Google Sheet post for ${tableName}:`, err));
-            }
-          }
-        } catch (cacheErr) {
-          console.warn("[LocalDB Mirror] Failed to synchronize created item:", cacheErr);
-        }
-        return payloadToSave;
+      if (tableName === 'attendance') {
+        payload.status = payload.status || 'PRESENT';
       }
       
       const sanitized = this.sanitize(payload);
       
-      // Remove known missing columns
+      // CockroachDB Bridge
+      if (tableName !== 'users') {
+        try {
+          const response = await fetch('/api/db/' + tableName + '/upsert', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ data: sanitized })
+          });
+          
+          if (!response.ok) {
+            const contentType = response.headers.get("content-type");
+            if (contentType && contentType.includes("application/json")) {
+              const errData = await response.json();
+              throw new Error(errData.error || `Server error ${response.status}`);
+            } else {
+              throw new Error(`Server returned non-JSON response (${response.status} ${response.statusText})`);
+            }
+          }
+
+          const result = await response.json();
+          if (result.error) throw new Error(result.error);
+          
+          const cloudData = this.desanitize(result.data);
+          
+          // Clear column and list cache for this table on successful interaction
+          if (this.columnCache[tableName]) this.columnCache[tableName].clear();
+          Object.keys(this.listCache).forEach(key => {
+            if (key.startsWith(`list_${tableName}_`)) delete this.listCache[key];
+          });
+          
+          return cloudData;
+        } catch (err: any) {
+          console.error(`CockroachDB Create Error [${table}]:`, err);
+          throw err;
+        }
+      }
+      
       if (this.columnCache[tableName]) {
         Object.keys(sanitized).forEach(key => {
           if (this.columnCache[tableName].has(key)) {
@@ -462,7 +456,6 @@ export class SupabaseService {
           const colName = match ? (match[1] || match[2] || '').toLowerCase() : null;
           if (colName) {
             if (this.columnCache[tableName]?.has(colName)) {
-              // We already knew this was missing, so this is a different error or we failed to skip it
               throw error;
             }
             console.warn(`[Supabase] Column '${colName}' not found in '${tableName}'. Skipping in future calls.`);
@@ -479,16 +472,6 @@ export class SupabaseService {
         throw error;
       }
 
-      // Save local cache mirror to guarantee immediate UI reactivity and local persistence
-      try {
-        LocalDB.upsert(tableName, payload.id, payload);
-      } catch (cacheErr) {
-        console.warn("[LocalDB Mirror] Failed to synchronize created item:", cacheErr);
-      }
-
-      // Dispatch local update event for reactivity even if created remotely
-      window.dispatchEvent(new Event(`local_db_update_${tableName}`));
-      
       return this.desanitize(result);
     } catch (err: any) {
       const msg = (err.message || String(err)).toLowerCase();
@@ -506,34 +489,42 @@ export class SupabaseService {
     if (this.missingTables.has(tableName)) return;
 
     try {
+      const sanitized = this.sanitize(data);
+      // NEVER update the ID column حتى if it's in the data object
+      delete sanitized.id;
+
+      // CockroachDB Bridge
       if (tableName !== 'users') {
         try {
-          LocalDB.update(tableName, id, data);
-          window.dispatchEvent(new Event(`local_db_update_${tableName}`));
+          const response = await fetch('/api/db/' + tableName + '/update', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+              data: sanitized,
+              filters: [{ column: 'id', value: id }]
+            })
+          });
           
-          const syncTabTypes = ['attendance', 'mismatches', 'ad_hoc_jobs'];
-          if (syncTabTypes.includes(tableName)) {
-            const sheetId = GoogleSheetsService.getStoredSpreadsheetId();
-            const token = GoogleSheetsService.getAccessToken();
-            if (sheetId && token) {
-              const fullRecord = LocalDB.getOne(tableName, id);
-              if (fullRecord) {
-                console.log(`[Auto-Sheets Sync] Updating changed ${tableName} record in Google Sheets...`, fullRecord);
-                GoogleSheetsService.pushRecordByType(sheetId, tableName, fullRecord)
-                  .then(() => console.log(`[Auto-Sheets Sync] ${tableName} update success.`))
-                  .catch(err => console.error(`[Auto-Sheets Sync] Error during real-time Google Sheet update for ${tableName}:`, err));
-              }
+          if (!response.ok) {
+            const contentType = response.headers.get("content-type");
+            if (contentType && contentType.includes("application/json")) {
+              const errData = await response.json();
+              throw new Error(errData.error || `Server error ${response.status}`);
+            } else {
+              throw new Error(`Server returned non-JSON response (${response.status} ${response.statusText})`);
             }
           }
-        } catch (cacheErr) {
-          console.warn("[LocalDB Mirror] Failed to synchronize updated item:", cacheErr);
-        }
-        return;
-      }
 
-      const sanitized = this.sanitize(data);
-      // NEVER update the ID column even if it's in the data object
-      delete sanitized.id;
+          const result = await response.json();
+          if (result.error) throw new Error(result.error);
+          
+          window.dispatchEvent(new Event(`local_db_update_${tableName}`));
+          return;
+        } catch (err) {
+          console.error(`CockroachDB Update Error [${table}]:`, err);
+          throw err;
+        }
+      }
 
       if (this.columnCache[tableName]) {
         Object.keys(sanitized).forEach(key => {
@@ -570,14 +561,10 @@ export class SupabaseService {
         throw error;
       }
 
-      // Save local cache mirror to guarantee immediate UI reactivity and local persistence
-      try {
-        LocalDB.update(tableName, id, data);
-      } catch (cacheErr) {
-        console.warn("[LocalDB Mirror] Failed to synchronize updated item:", cacheErr);
+      // Notify others via broadcast if it's a mirrored/cockroach table
+      if (tableName !== 'users' && isConfigured) {
+        this.sendBroadcast(`table_update_${tableName}`, 'UPDATE', { table: tableName, id });
       }
-
-      window.dispatchEvent(new Event(`local_db_update_${tableName}`));
     } catch (err: any) {
       const msg = (err.message || String(err)).toLowerCase();
       if (retries > 0 && (msg.includes('fetch') || msg.includes('network') || msg.includes('timeout') || err.code === 'fetch_error')) {
@@ -597,33 +584,38 @@ export class SupabaseService {
     if (this.missingTables.has(tableName)) return;
 
     try {
-      if (tableName !== 'users') {
-        try {
-          LocalDB.upsert(tableName, id, data);
-          window.dispatchEvent(new Event(`local_db_update_${tableName}`));
-          
-          const syncTabTypes = ['attendance', 'mismatches', 'ad_hoc_jobs'];
-          if (syncTabTypes.includes(tableName)) {
-            const sheetId = GoogleSheetsService.getStoredSpreadsheetId();
-            const token = GoogleSheetsService.getAccessToken();
-            if (sheetId && token) {
-              const fullRecord = LocalDB.getOne(tableName, id);
-              if (fullRecord) {
-                console.log(`[Auto-Sheets Sync] Upserting ${tableName} record to Google Sheets...`, fullRecord);
-                GoogleSheetsService.pushRecordByType(sheetId, tableName, fullRecord)
-                  .then(() => console.log(`[Auto-Sheets Sync] ${tableName} upsert success.`))
-                  .catch(err => console.error(`[Auto-Sheets Sync] Error during real-time Google Sheet upsert for ${tableName}:`, err));
-              }
-            }
-          }
-        } catch (cacheErr) {
-          console.warn("[LocalDB Mirror] Failed to synchronize upserted item:", cacheErr);
-        }
-        return;
-      }
-
       const payload = { ...data, id };
       const sanitized = this.sanitize(payload);
+
+      // CockroachDB Bridge
+      if (tableName !== 'users') {
+        try {
+          const response = await fetch('/api/db/' + tableName + '/upsert', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ data: sanitized })
+          });
+          
+          if (!response.ok) {
+            const contentType = response.headers.get("content-type");
+            if (contentType && contentType.includes("application/json")) {
+              const errData = await response.json();
+              throw new Error(errData.error || `Server error ${response.status}`);
+            } else {
+              throw new Error(`Server returned non-JSON response (${response.status} ${response.statusText})`);
+            }
+          }
+
+          const result = await response.json();
+          if (result.error) throw new Error(result.error);
+          
+          window.dispatchEvent(new Event(`local_db_update_${tableName}`));
+          return;
+        } catch (err) {
+          console.error(`CockroachDB Upsert Error [${table}]:`, err);
+          throw err;
+        }
+      }
 
       if (this.columnCache[tableName]) {
         Object.keys(sanitized).forEach(key => {
@@ -656,14 +648,10 @@ export class SupabaseService {
         throw error;
       }
 
-      // Save local cache mirror to guarantee immediate UI reactivity and local persistence
-      try {
-        LocalDB.upsert(tableName, id, data);
-      } catch (cacheErr) {
-        console.warn("[LocalDB Mirror] Failed to synchronize upserted item:", cacheErr);
+      // Notify others via broadcast if it's a mirrored/cockroach table
+      if (tableName !== 'users' && isConfigured) {
+        this.sendBroadcast(`table_update_${tableName}`, 'UPSERT', { table: tableName, id });
       }
-
-      window.dispatchEvent(new Event(`local_db_update_${tableName}`));
     } catch (err: any) {
       const msg = (err.message || String(err)).toLowerCase();
       if (retries > 0 && (msg.includes('fetch') || msg.includes('network') || msg.includes('timeout') || err.code === 'fetch_error')) {
@@ -678,28 +666,44 @@ export class SupabaseService {
   static async delete(table: string, id: string, retries = 3): Promise<void> {
     const tableName = table.toLowerCase();
     try {
+      // CockroachDB Bridge
       if (tableName !== 'users') {
         try {
-          LocalDB.delete(tableName, id);
-        } catch (cacheErr) {
-          console.warn("[LocalDB Mirror] Failed to synchronize deleted item:", cacheErr);
+          const response = await fetch('/api/db/' + tableName + '/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filters: [{ column: 'id', value: id }] })
+          });
+          
+          if (!response.ok) {
+            const contentType = response.headers.get("content-type");
+            if (contentType && contentType.includes("application/json")) {
+              const errData = await response.json();
+              throw new Error(errData.error || `Server error ${response.status}`);
+            } else {
+              throw new Error(`Server returned non-JSON response (${response.status} ${response.statusText})`);
+            }
+          }
+
+          const result = await response.json();
+          if (result.error) throw new Error(result.error);
+          
+          window.dispatchEvent(new Event(`local_db_update_${tableName}`));
+          return;
+        } catch (err) {
+          console.error(`CockroachDB Delete Error [${table}]:`, err);
+          throw err;
         }
-        window.dispatchEvent(new Event(`local_db_update_${tableName}`));
-        return;
       }
 
       const { error } = await supabase
-        .from(table.toLowerCase())
+        .from(tableName)
         .delete()
         .eq('id', id);
-        
-      if (error) throw error;
 
-      // Save local cache mirror to guarantee immediate UI reactivity and local persistence
-      try {
-        LocalDB.delete(table.toLowerCase(), id);
-      } catch (cacheErr) {
-        console.warn("[LocalDB Mirror] Failed to synchronize deleted item:", cacheErr);
+      // Notify others via broadcast if it's a mirrored/cockroach table
+      if (tableName !== 'users' && isConfigured) {
+        this.sendBroadcast(`table_update_${tableName}`, 'DELETE', { table: tableName, id });
       }
 
       window.dispatchEvent(new Event(`local_db_update_${table.toLowerCase()}`));
@@ -719,14 +723,34 @@ export class SupabaseService {
   static async deleteWhere(table: string, filters: { column: string; value: any; operator?: string }[], retries = 3): Promise<void> {
     const tableName = table.toLowerCase();
     try {
+      // CockroachDB Bridge
       if (tableName !== 'users') {
         try {
-          LocalDB.deleteWhere(tableName, filters);
-        } catch (cacheErr) {
-          console.warn("[LocalDB Mirror] Failed to synchronize deleteWhere items:", cacheErr);
+          const response = await fetch('/api/db/' + tableName + '/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filters })
+          });
+          
+          if (!response.ok) {
+            const contentType = response.headers.get("content-type");
+            if (contentType && contentType.includes("application/json")) {
+              const errData = await response.json();
+              throw new Error(errData.error || `Server error ${response.status}`);
+            } else {
+              throw new Error(`Server returned non-JSON response (${response.status} ${response.statusText})`);
+            }
+          }
+
+          const result = await response.json();
+          if (result.error) throw new Error(result.error);
+          
+          window.dispatchEvent(new Event(`local_db_update_${tableName}`));
+          return;
+        } catch (err) {
+          console.error(`CockroachDB DeleteWhere Error [${table}]:`, err);
+          throw err;
         }
-        window.dispatchEvent(new Event(`local_db_update_${tableName}`));
-        return;
       }
 
       let query = supabase.from(tableName).delete();
@@ -741,11 +765,9 @@ export class SupabaseService {
       const { error } = await query;
       if (error) throw error;
 
-      // Save local cache mirror to guarantee immediate UI reactivity and local persistence
-      try {
-        LocalDB.deleteWhere(table.toLowerCase(), filters);
-      } catch (cacheErr) {
-        console.warn("[LocalDB Mirror] Failed to synchronize deleteWhere items:", cacheErr);
+      // Notify others via broadcast if it's a mirrored/cockroach table
+      if (tableName !== 'users' && isConfigured) {
+        this.sendBroadcast(`table_update_${tableName}`, 'DELETE_WHERE', { table: tableName });
       }
 
       window.dispatchEvent(new Event(`local_db_update_${table.toLowerCase()}`));
@@ -780,52 +802,35 @@ export class SupabaseService {
   static subscribe(table: string, callback: (payload: any) => void) {
     const tableName = table.toLowerCase();
     
-    // 1. Always listen to LocalDB updates
-    const localEventName = `local_db_update_${tableName}`;
-    const localHandler = () => {
-      this.list(table).then(callback).catch(err => console.error(`Local Subscription error [${table}]:`, err));
-    };
-    window.addEventListener(localEventName, localHandler);
-
-    // 2. Try Supabase subscription if configured and not restricted
-    let subChannel: any = null;
-    const canSubscribeSupabase = isConfigured && !getUseLocalFallback();
-
-    if (canSubscribeSupabase) {
-      try {
-        const channelId = `pub:${table}:${Math.random().toString(36).substring(2, 7)}`;
-        const channel = realSupabase.channel(channelId);
-        
-        subChannel = channel.on(
-          'postgres_changes',
-          { event: '*', schema: 'public', table: table.toLowerCase() },
-          () => {
-            this.list(table).then(callback).catch(err => console.error(`Supabase Subscription fetch error [${table}]:`, err));
-          }
-        );
-        
-        subChannel.subscribe();
-      } catch (err) {
-        console.error("Supabase Subscription setup failed, relying on local tracker", err);
-      }
-    }
-
-    return {
-      unsubscribe: () => {
-        window.removeEventListener(localEventName, localHandler);
-        if (subChannel) {
-          try {
-            if (typeof subChannel.unsubscribe === 'function') {
-              subChannel.unsubscribe();
-            } else {
-              realSupabase.removeChannel(subChannel);
-            }
-          } catch (e) {
-            console.warn("Error unsubscribing channel", e);
-          }
+    // Smarter handler with cooldown to prevent rapid UI flashing & lag
+    const handler = () => {
+      const now = Date.now();
+      const lastCall = this.subCooldowns[tableName] || 0;
+      if (now - lastCall < 150) return; // 150ms throttle (faster response than 300ms)
+      this.subCooldowns[tableName] = now;
+      
+      this.list(table).then(callback).catch(e => {
+        // Only log if it's not a temporary error
+        if (!String(e).includes('rate limit')) {
+           console.error(`Subscription fetch error [${table}]:`, e);
         }
-      }
+      });
     };
+
+      const unsubSocket = socketService.on(`table_update_${tableName}`, handler);
+
+      let subChannel: any = null;
+      if (tableName === 'users' && isConfigured) {
+        const channel = realSupabase.channel(`pub:users_realtime`);
+        subChannel = channel.on('postgres_changes', { event: '*', schema: 'public', table: 'users' }, handler).subscribe();
+      }
+
+      return {
+        unsubscribe: () => {
+          unsubSocket();
+          if (subChannel) realSupabase.removeChannel(subChannel);
+        }
+      };
   }
 
   private static broadcastChannels: Map<string, any> = new Map();
@@ -834,7 +839,7 @@ export class SupabaseService {
    * Broadcasts ephemeral data to a channel
    */
   static async sendBroadcast(channelName: string, event: string, payload: any) {
-    if (!isSupabaseLive()) return;
+    if (!isConfigured) return;
     
     let channel = this.broadcastChannels.get(channelName);
     
@@ -876,7 +881,7 @@ export class SupabaseService {
    * Listens to ephemeral broadcasts on a channel
    */
   static onBroadcast(channelName: string, event: string, callback: (payload: any) => void) {
-    if (!isSupabaseLive()) return { unsubscribe: () => {} };
+    if (!isConfigured) return { unsubscribe: () => {} };
     
     const channel = supabase.channel(`sub:${channelName}:${Math.random().toString(36).substring(2, 7)}`, {
       config: { broadcast: { self: false } }
@@ -896,7 +901,7 @@ export class SupabaseService {
   }
 
   static async fetchFallbackItem(table: string, id: string): Promise<any | null> {
-    if (!isSupabaseLive()) return null;
+    if (!isConfigured) return null;
     try {
       const { data, error } = await supabase
         .from(table.toLowerCase())
@@ -914,9 +919,9 @@ export class SupabaseService {
       return null;
     }
   }
-
+ 
   static async fetchFallback(table: string): Promise<any[] | null> {
-    if (!isSupabaseLive()) return null;
+    if (!isConfigured) return null;
     try {
       const { data, error } = await supabase
         .from(table.toLowerCase())
@@ -936,6 +941,11 @@ export class SupabaseService {
   static clearCache() {
     this.columnCache = {};
     this.missingTables = new Set();
+  }
+
+  static async syncPendingRecords() {
+    // Disabled as per user request to always use direct DB
+    return;
   }
 
   static async checkSystemHealth(): Promise<{ [key: string]: boolean }> {

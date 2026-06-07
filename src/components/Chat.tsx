@@ -197,10 +197,10 @@ export default function Chat() {
       </div>
 
       <div className="flex-1 overflow-y-auto p-6 space-y-6">
-        {filteredMessages.map((msg) => {
+        {filteredMessages.map((msg, idx) => {
           const isMe = msg.senderId === user?.id;
           return (
-            <div key={msg.id} className={cn("flex flex-col", isMe ? "items-end" : "items-start")}>
+            <div key={`${msg.id || 'no-id'}-${idx}`} className={cn("flex flex-col", isMe ? "items-end" : "items-start")}>
               <span className="text-[10px] font-bold text-text-secondary mb-1 px-1 uppercase tracking-widest opacity-50">
                 {msg.senderName} • {msg.timestamp ? format(new Date((msg.timestamp as any)?.toDate?.() || msg.timestamp), 'hh:mm a') : '...'}
               </span>

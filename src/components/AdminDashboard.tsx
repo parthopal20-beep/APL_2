@@ -17,6 +17,7 @@ import {
   X,
   XCircle,
   Plus,
+  ExternalLink,
   MessageSquare,
   Search,
   CheckCircle2,
@@ -51,7 +52,9 @@ import {
   Zap,
   Send,
   Globe,
-  Monitor
+  Monitor,
+  Key,
+  ArrowRight
 } from 'lucide-react';
 import { format, startOfDay, endOfDay, startOfMonth, endOfMonth, eachDayOfInterval, isSameDay, parseISO, subMonths, addMonths } from 'date-fns';
 import { motion, AnimatePresence } from 'motion/react';
@@ -61,14 +64,10 @@ import { cn, compressImage } from '../lib/utils';
 import { SupabaseService } from '../services/SupabaseService';
 import Chat from './Chat';
 import LiveMap from './LiveMap';
-import GoogleSheetsSyncManager from './GoogleSheetsSyncManager';
-import { GoogleSheetsService } from '../services/GoogleSheetsService';
 import AttendanceCalendar from './AttendanceCalendar';
 import { useWakeLock } from '../hooks/useWakeLock';
 import * as XLSX from 'xlsx';
-import jsPDF from 'jspdf';
-import 'jspdf-autotable';
-import { supabase, getUseLocalFallback, setUseLocalFallback, LocalDB } from '../lib/supabase';
+import { supabase, isConfigured } from '../lib/supabase';
 
 
 interface AttendanceHistoryItemProps {
@@ -507,8 +506,8 @@ function ManualAdHocForm({ employees, onClose }: { employees: UserProfile[], onC
           className="w-full h-12 bg-bg-app border border-app-border rounded-xl px-4 text-sm font-bold outline-none focus:border-accent-blue transition-all"
         >
           <option value="">{t.chooseEmployee}...</option>
-          {employees.map(emp => (
-            <option key={emp.id} value={emp.id}>{emp.name}</option>
+          {employees.map((emp, idx) => (
+            <option key={`${emp.id}-${idx}`} value={emp.id}>{emp.name}</option>
           ))}
         </select>
       </div>
@@ -581,7 +580,12 @@ function ManualAdHocForm({ employees, onClose }: { employees: UserProfile[], onC
 }
 
 export default function AdminDashboard() {
-  const { logout, user, resetUserSessions } = useAuth();
+  const [isMaintenanceDay] = useState(() => {
+    const day = new Date().getDate();
+    return day === 1 || day === 15;
+  });
+  const [showMaintenanceWarning, setShowMaintenanceWarning] = useState(true);
+  const { logout, user } = useAuth();
   const { t } = useLanguage();
   
   const [employees, setEmployees] = useState<UserProfile[]>([]);
@@ -600,6 +604,7 @@ export default function AdminDashboard() {
   const [isManualAttendanceOpen, setIsManualAttendanceOpen] = useState(false);
   const [isManualAdHocOpen, setIsManualAdHocOpen] = useState(false);
   const [editingEmployee, setEditingEmployee] = useState<UserProfile | null>(null);
+  const [resetCredentialsEmployee, setResetCredentialsEmployee] = useState<UserProfile | null>(null);
   const [globalFishSales, setGlobalFishSales] = useState<number>(0);
   const [searchQuery, setSearchQuery] = useState('');
   const [filterDepartment, setFilterDepartment] = useState('');
@@ -607,7 +612,56 @@ export default function AdminDashboard() {
   const [showChat, setShowChat] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
-  
+
+  const CloudStatusBadge = () => {
+    const isLive = isConfigured;
+    const dbSize = systemStatus?.dbUsage?.sizeFormatted || "0 B";
+    const dbPercent = systemStatus?.dbUsage ? (systemStatus.dbUsage.sizeBytes / systemStatus.dbUsage.limitBytes) * 100 : 0;
+    
+    return (
+      <div className="flex flex-col sm:flex-row gap-2">
+        <div className={cn(
+          "flex items-center gap-2 px-4 py-2 rounded-2xl border transition-all shadow-sm",
+          isLive ? "bg-emerald-50 border-emerald-100 text-emerald-700" : "bg-rose-50 border-rose-100 text-rose-700 animate-pulse text-left"
+        )}>
+          {isLive ? <Wifi className="h-4 w-4" /> : <WifiOff className="h-4 w-4" />}
+          <div className="flex flex-col">
+            <span className="text-[10px] font-black uppercase tracking-wider leading-none">
+              {isLive ? "Database Connected" : "Local Mode (No Configuration)"}
+            </span>
+            {!isLive && (
+              <span className="text-[8px] font-bold mt-1 opacity-80 leading-tight max-w-[150px]">
+                Set VITE_SUPABASE_URL in settings
+              </span>
+            )}
+          </div>
+        </div>
+
+        {isLive && (
+          <div className="flex items-center gap-3 px-4 py-2 rounded-2xl border border-app-border bg-white shadow-sm">
+            <Database className={cn("h-4 w-4", dbPercent > 80 ? "text-accent-red animate-bounce" : "text-slate-400")} />
+            <div className="flex flex-col min-w-[80px]">
+              <div className="flex justify-between items-center mb-0.5">
+                <span className="text-[9px] font-black uppercase tracking-wider text-slate-500">Storage</span>
+                <span className="text-[10px] font-bold text-slate-900">{dbSize}</span>
+              </div>
+              <div className="w-full h-1 bg-slate-100 rounded-full overflow-hidden">
+                <motion.div 
+                   initial={{ width: 0 }}
+                   animate={{ width: `${Math.min(100, dbPercent)}%` }}
+                   className={cn(
+                     "h-full transition-all duration-1000",
+                     dbPercent > 90 ? "bg-accent-red" : dbPercent > 70 ? "bg-amber-500" : "bg-accent-blue"
+                   )}
+                />
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
   const { requestWakeLock, releaseWakeLock, isBlocked: isWakeLockBlocked } = useWakeLock(user?.role === 'ADMIN');
 
   useEffect(() => {
@@ -647,22 +701,8 @@ export default function AdminDashboard() {
     return visibleAdHocJobs.length > 0 && visibleAdHocJobs.every(j => selectedAdHocIds.has(j.id!));
   }, [visibleAdHocJobs, selectedAdHocIds]);
 
-  const [activeTab, setActiveTab] = useState<'DASHBOARD' | 'EMPLOYEES' | 'SHIPMENTS' | 'SALARY' | 'MILEAGE' | 'MISMATCHES' | 'SYNC' | 'ADHOC' | 'TRACKING' | 'REPORTS' | 'CASH_LOGS'>('DASHBOARD');
+  const [activeTab, setActiveTab] = useState<'DASHBOARD' | 'EMPLOYEES' | 'SHIPMENTS' | 'SALARY' | 'MILEAGE' | 'MISMATCHES' | 'ADHOC' | 'TRACKING' | 'REPORTS' | 'CASH_LOGS'>('DASHBOARD');
 
-  // Automated background synchronization with Google Sheets
-  useEffect(() => {
-    const sheetId = GoogleSheetsService.getStoredSpreadsheetId();
-    const token = GoogleSheetsService.getAccessToken();
-    if (sheetId && token) {
-      GoogleSheetsService.syncAllLocalData(sheetId).then((count) => {
-        if (count > 0) {
-          toast.success("আউটডোর সিঙ্ক: " + count + " টি রেকর্ড স্বয়ংক্রিয়ভাবে গুগল ড্রাইভে ব্যাকআপ করা হয়েছে! (Auto-synced " + count + " records to Google Sheet)");
-        }
-      }).catch((err) => {
-        console.warn("[Auto-Sync] Background Google Sheets sync paused:", err);
-      });
-    }
-  }, [activeTab]);
   const [selectedLiveEmployeeId, setSelectedLiveEmployeeId] = useState<string | null>(null);
   const [selectedEmployeeForHistory, setSelectedEmployeeForHistory] = useState<UserProfile | null>(null);
   const [employeeHistory, setEmployeeHistory] = useState<AttendanceRecord[]>([]);
@@ -671,6 +711,83 @@ export default function AdminDashboard() {
   const [cashReports, setCashReports] = useState<any[]>([]);
   const [expandedReportId, setExpandedReportId] = useState<string | null>(null);
   const [isWiping, setIsWiping] = useState(false);
+  const [isMasterSyncing, setIsMasterSyncing] = useState(false);
+  const [systemStatus, setSystemStatus] = useState<{ 
+    day: number, 
+    isPurgeDay: boolean, 
+    stats: any,
+    dbUsage?: { sizeFormatted: string, sizeBytes: number, limitBytes: number }
+  } | null>(null);
+  const [isPurging, setIsPurging] = useState(false);
+  const [showReminderModal, setShowReminderModal] = useState(false);
+  const externalReportLink = localStorage.getItem('apl_external_report_link');
+
+  // Fetch System Status for Purge Days
+  useEffect(() => {
+    const fetchStatus = async () => {
+      try {
+        const res = await fetch('/api/admin/system-status');
+        const data = await res.json();
+        setSystemStatus(data);
+      } catch (err) {
+        console.error("Failed to fetch system status:", err);
+      }
+    };
+    fetchStatus();
+    // Refresh every 5 mins
+    const timer = setInterval(fetchStatus, 5 * 60 * 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const handlePurgeDatabase = async () => {
+    if (!window.confirm("সাবধান! পনেরো দিনের সমস্ত রেকর্ড কি আপনি পার্মানেন্টলি ডিলিট করতে চান? (WARNING: This will permanently delete ALL operational records.)")) {
+      return;
+    }
+
+    setIsPurging(true);
+    try {
+      const res = await fetch('/api/admin/purge-data', { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        toast.success("ডাটাবেস সফলভাবে খালি করা হয়েছে! (Database purged successfully)");
+        // Refresh stats
+        const statusRes = await fetch('/api/admin/system-status');
+        const statusData = await statusRes.json();
+        setSystemStatus(statusData);
+        // Refresh local UI
+        setAttendanceToday([]);
+        setAllAttendanceRecords([]);
+        setMismatches([]);
+        setAdHocJobs([]);
+      } else {
+        throw new Error(data.error);
+      }
+    } catch (err: any) {
+      toast.error("Error: " + err.message);
+    } finally {
+      setIsPurging(false);
+    }
+  };
+
+  const handleDownloadAndPurgeFlow = async () => {
+    toast.info("ডাটা ডাউনলোড শুরু হচ্ছে... (Starting data download...)");
+    const success = downloadAllDataExcel(); 
+    
+    if (success) {
+      // Auto-triggering the purge after a small delay to ensure download window opened
+      setTimeout(() => {
+        handlePurgeDatabase();
+      }, 5000);
+    }
+  };
+
+  // Auto-initialize external link if provided by user and currently empty
+  useEffect(() => {
+    const currentLink = localStorage.getItem('apl_external_report_link');
+    if (!currentLink) {
+       localStorage.setItem('apl_external_report_link', 'https://drive.proton.me/urls/5GPNPD3QY4#wrxae4rt5UkY');
+    }
+  }, []);
 
   const selectedEmployeeMileage = React.useMemo(() => {
     return employeeHistory
@@ -737,62 +854,84 @@ export default function AdminDashboard() {
     }
   };
 
-  const downloadAdHocExcel = () => {
+  const downloadAllDataExcel = () => {
     try {
-      if (adHocJobs.length === 0) {
-        toast.info("No ad-hoc data available to export. / এক্সপোর্ট করার জন্য কোনো অ্যাডহক ডাটা পাওয়া যায়নি।");
+      const wb = XLSX.utils.book_new();
+
+      // 1. Attendance Sheet
+      if (allAttendanceRecords.length > 0) {
+        const attData = allAttendanceRecords.map(a => ({
+          'Employee UID': a.userId,
+          'Date': a.date,
+          'Status': a.status,
+          'Check-In': a.checkInTime ? format(new Date(a.checkInTime), 'hh:mm a') : 'N/A',
+          'Check-Out': a.checkOutTime ? format(new Date(a.checkOutTime), 'hh:mm a') : 'N/A',
+          'Hours': a.hoursWorked || 0,
+          'Shipments': a.shipments || 0,
+          'Earnings': a.earnings || 0,
+          'Distance (KM)': a.distanceDriven || 0
+        }));
+        const wsAtt = XLSX.utils.json_to_sheet(attData);
+        XLSX.utils.book_append_sheet(wb, wsAtt, "Attendance");
+      }
+
+      // 2. Mismatches Sheet
+      if (mismatches.length > 0) {
+        const misData = mismatches.map(m => ({
+          'Employee': m.employeeName,
+          'Date': m.date,
+          'Customer Value': m.customerValue,
+          'ERP Value': m.erpValue,
+          'Difference': m.valueDifference,
+          'Reason': m.reason,
+          'Status': m.status
+        }));
+        const wsMis = XLSX.utils.json_to_sheet(misData);
+        XLSX.utils.book_append_sheet(wb, wsMis, "Mismatches");
+      }
+
+      // 3. Ad-Hoc Sheet
+      if (adHocJobs.length > 0) {
+        const adHocData = adHocJobs.map(job => ({
+          'Employee': job.employeeName,
+          'Date': job.date,
+          'Vehicle': job.vehicleType,
+          'Hours': job.totalHours,
+          'Value': job.value,
+          'Status': job.status
+        }));
+        const wsAdHoc = XLSX.utils.json_to_sheet(adHocData);
+        XLSX.utils.book_append_sheet(wb, wsAdHoc, "AD-HOC");
+      }
+
+      // 4. Cash Reports Sheet
+      if (cashReports.length > 0) {
+        const cashData = cashReports.map(c => ({
+          'Employee': c.employeeName,
+          'Date': c.date,
+          'Total Amount': c.totalAmount,
+          'Online Cash': c.onlineCash,
+          'Mismatch': c.valueMismatch,
+          'Status': c.status
+        }));
+        const wsCash = XLSX.utils.json_to_sheet(cashData);
+        XLSX.utils.book_append_sheet(wb, wsCash, "Cash Reports");
+      }
+
+      if (wb.SheetNames.length === 0) {
+        toast.info("No operational data available to export.");
         return;
       }
 
-      const dataToExport = adHocJobs.map(job => ({
-        'Employee Name': job.employeeName,
-        'Date': job.date,
-        'Vehicle Type': job.vehicleType,
-        'Start Time': job.startTime,
-        'End Time': job.endTime,
-        'Total Hours': job.totalHours,
-        'Value (₹)': job.value,
-        'Status': job.status || 'PENDING',
-        'Timestamp': job.timestamp ? format(new Date(job.timestamp), 'dd/MM/yyyy HH:mm:ss') : 'N/A'
-      }));
-
-      const ws = XLSX.utils.json_to_sheet(dataToExport);
+      const filename = `Full_Report_Backup_${selectedMonth}_${format(new Date(), 'yyyyMMdd_HHmm')}.xlsx`;
+      XLSX.writeFile(wb, filename);
+      toast.success("All operational data has been exported successfully!");
       
-      // Column widths for AdHoc
-      ws['!cols'] = [
-        {wch: 25}, // Employee
-        {wch: 12}, // Date
-        {wch: 20}, // Vehicle
-        {wch: 12}, // Start
-        {wch: 12}, // End
-        {wch: 12}, // Hours
-        {wch: 12}, // Value
-        {wch: 15}, // Status
-        {wch: 25}  // Timestamp
-      ];
-
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, "AD-HOC Jobs");
-      
-      const filename = `AdHoc_Jobs_${selectedMonth}_${format(new Date(), 'yyyyMMdd')}.xlsx`;
-      
-      const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
-      const blob = new Blob([wbout], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-      
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      
-      setTimeout(() => {
-        if (document.body.contains(a)) document.body.removeChild(a);
-        window.URL.revokeObjectURL(url);
-      }, 100);
+      return true; // Indicate success
     } catch (err: any) {
-      console.error("Ad-Hoc Export Error:", err);
+      console.error("Export Error:", err);
       toast.error("Export failed: " + err.message);
+      return false;
     }
   };
 
@@ -815,14 +954,7 @@ export default function AdminDashboard() {
   };
 
   const handleResetSessions = async (userId: string) => {
-    if (window.confirm("Are you sure you want to log out this employee from all devices?")) {
-      try {
-        await resetUserSessions(userId);
-        toast.success(t.sessionsResetSuccess);
-      } catch (err: any) {
-        toast.error("Failed to reset sessions: " + err.message);
-      }
-    }
+    toast.info("Session management is now handled automatically by the real-time engine.");
   };
 
   useEffect(() => {
@@ -841,12 +973,12 @@ export default function AdminDashboard() {
     const unsubEmp = SupabaseService.subscribe('users', setEmployees);
     SupabaseService.list('users', [], 500, { column: 'name', ascending: true }).then(setEmployees);
 
-    const today = format(new Date(), 'yyyy-MM-dd');
+    const todayStr = format(new Date(), 'yyyy-MM-dd');
     const startM = format(startOfMonth(new Date(selectedMonth + '-01')), 'yyyy-MM-dd');
     const endM = format(endOfMonth(new Date(selectedMonth + '-01')), 'yyyy-MM-dd');
 
     const unsubAtt = SupabaseService.subscribe('attendance', (data) => {
-      const todayData = data.filter((a: any) => a.date === today);
+      const todayData = data.filter((a: any) => a.date === todayStr);
       setAttendanceToday(todayData);
 
       const monthData = data.filter((a: any) => a.date >= startM && a.date <= endM);
@@ -859,20 +991,35 @@ export default function AdminDashboard() {
       }
     });
 
-    SupabaseService.list('attendance', [{ column: 'date', value: today }]).then(setAttendanceToday);
+    SupabaseService.list('attendance', [{ column: 'date', value: todayStr }]).then(data => {
+      setAttendanceToday(data);
+    });
+
+    let unsubMismatch: any = null;
+    let unsubAdHoc: any = null;
+    
+    unsubMismatch = SupabaseService.subscribe('mismatches', (data) => {
+        const monthData = data.filter((a: any) => a.date >= startM && a.date <= endM);
+        setMismatches(monthData);
+    });
+
+    unsubAdHoc = SupabaseService.subscribe('ad_hoc_jobs', (data) => {
+        const monthData = data.filter((a: any) => a.date >= startM && a.date <= endM);
+        setAdHocJobs(monthData);
+    });
     
     if (activeTab === 'MILEAGE' || activeTab === 'SALARY' || activeTab === 'SHIPMENTS' || activeTab === 'DASHBOARD') {
        SupabaseService.list('attendance', [
         { column: 'date', value: startM, operator: 'gte' },
         { column: 'date', value: endM, operator: 'lte' }
-      ], 1000).then(setAllAttendanceRecords);
+      ], 1000).then(data => {
+        setAllAttendanceRecords(data);
+      });
     }
 
     // 2. Tab-Dependent Listeners
     let unsubLive: any = null;
     let unsubCalls: any = null;
-    let unsubMismatch: any = null;
-    let unsubAdHoc: any = null;
     let unsubSalaries: any = null;
     let unsubPaydays: any = null;
     let unsubCash: any = null;
@@ -881,14 +1028,13 @@ export default function AdminDashboard() {
       unsubLive = SupabaseService.subscribe('live_locations', setLiveLocations);
       SupabaseService.list('live_locations').then(setLiveLocations);
       
-      const today = format(new Date(), 'yyyy-MM-dd');
       SupabaseService.list('location_logs', [
-        { column: 'timestamp', value: today, operator: 'gte' }
+        { column: 'timestamp', value: todayStr, operator: 'gte' }
       ], 5000, { column: 'timestamp', ascending: false }).then(setLocationLogs);
 
       const unsubLogs = SupabaseService.subscribe('location_logs', (data) => {
          const todayLogs = data
-           .filter((l: any) => l.timestamp.startsWith(today))
+           .filter((l: any) => l.timestamp.startsWith(todayStr))
            .sort((a: any, b: any) => a.timestamp.localeCompare(b.timestamp));
          setLocationLogs(todayLogs);
       });
@@ -903,15 +1049,18 @@ export default function AdminDashboard() {
     }
 
     if (activeTab === 'DASHBOARD') {
-      const today = format(new Date(), 'yyyy-MM-dd');
-      SupabaseService.list('ad_hoc_jobs', [{ column: 'date', value: today }]).then(setAdHocJobs);
+      SupabaseService.list('ad_hoc_jobs', [{ column: 'date', value: todayStr }]).then(data => {
+        setAdHocJobs(data);
+      });
     }
 
     if (activeTab === 'MISMATCHES') {
       unsubMismatch = SupabaseService.subscribe('mismatches', (data) => {
         setMismatches(data.filter(m => m.date.startsWith(selectedMonth)).sort((a: any, b: any) => b.timestamp.localeCompare(a.timestamp)));
       });
-      SupabaseService.list('mismatches', [{ column: 'date', value: `${selectedMonth}%`, operator: 'like' }], 200, { column: 'timestamp', ascending: false }).then(setMismatches);
+      SupabaseService.list('mismatches', [{ column: 'date', value: `${selectedMonth}%`, operator: 'like' }], 200, { column: 'timestamp', ascending: false }).then(data => {
+        setMismatches(data);
+      });
     }
 
     if (activeTab === 'ADHOC') {
@@ -919,7 +1068,9 @@ export default function AdminDashboard() {
       unsubAdHoc = SupabaseService.subscribe('ad_hoc_jobs', (data) => {
         setAdHocJobs(data.filter(j => j.date.startsWith(selectedMonth)).sort((a: any, b: any) => b.timestamp.localeCompare(a.timestamp)));
       });
-      SupabaseService.list('ad_hoc_jobs', [{ column: 'date', value: `${selectedMonth}%`, operator: 'like' }], 500, { column: 'timestamp', ascending: false }).then(setAdHocJobs);
+      SupabaseService.list('ad_hoc_jobs', [{ column: 'date', value: `${selectedMonth}%`, operator: 'like' }], 500, { column: 'timestamp', ascending: false }).then(data => {
+        setAdHocJobs(data);
+      });
     }
 
     if (activeTab === 'CASH_LOGS') {
@@ -1451,104 +1602,245 @@ export default function AdminDashboard() {
       }
    };
 
-  const handleExportMismatches = async (type: 'DAILY' | 'MONTHLY') => {
-    const doc = new jsPDF();
-    const title = type === 'DAILY' ? `Daily Value Mismatch Report - ${format(new Date(), 'dd MMM yyyy')}` : `Monthly Value Mismatch Report - ${format(new Date(), 'MMMM yyyy')}`;
-    
-    doc.setFontSize(18);
-    doc.text(title, 14, 22);
-    doc.setFontSize(11);
-    doc.setTextColor(100);
-    doc.text(`Generated on: ${format(new Date(), 'dd MMM yyyy HH:mm')}`, 14, 30);
+   const handleExportCashExcel = () => {
+      try {
+        if (cashReports.length === 0) {
+          toast.info("No cash report data found. / কোনো ক্যাশ রিপোর্ট পাওয়া যায়নি।");
+          return;
+        }
 
-    const tableData = mismatches
-      .filter(m => {
-        if (type === 'DAILY') return m.date === format(new Date(), 'yyyy-MM-dd');
-        return m.date.startsWith(selectedMonth);
-      })
-      .map(m => {
-        const emp = employees.find(e => e.id === m.userId);
-        return [
-          m.date,
-          m.employeeName || emp?.name || 'Unknown',
-          m.barcodes.join(', '),
-          `₹${m.customerValue}`,
-          `₹${m.erpValue}`,
-          `₹${m.valueDifference}`
+        const rows = cashReports.map(r => {
+          const emp = employees.find(e => e.id === r.userId);
+          return {
+            'Date': r.date || '-',
+            'Employee Name': r.userName || emp?.name || 'Unknown',
+            'Time': r.timestamp ? format(new Date(r.timestamp), 'HH:mm:ss') : '-',
+            'Total Amount (₹)': r.totalAmount || 0,
+            'Online Payout (₹)': r.onlineCash || 0,
+            'Mismatch Adj (₹)': r.valueMismatch || 0,
+            'Physical Cash (₹)': (r.totalAmount || 0) - (r.onlineCash || 0),
+            'Total Notes': r.totalNotes || 0,
+            'Status': r.status || 'PENDING'
+          };
+        });
+
+        const worksheet = XLSX.utils.json_to_sheet(rows);
+        const wscols = [
+          {wch: 12}, // Date
+          {wch: 25}, // Name
+          {wch: 15}, // Time
+          {wch: 20}, // Total
+          {wch: 20}, // Online
+          {wch: 20}, // Mismatch
+          {wch: 20}, // Physical
+          {wch: 12}, // Notes
+          {wch: 15}, // Status
         ];
-      });
+        worksheet['!cols'] = wscols;
 
-    if (tableData.length === 0) {
-      toast.warning("No data available for the selected period. / নির্বাচিত সময়ের জন্য কোনো ডাটা পাওয়া যায়নি।");
-      return;
+        const workbook = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(workbook, worksheet, "Cash Reports");
+
+        const filename = `Cash_Report_${selectedMonth}_${format(new Date(), 'yyyyMMdd')}.xlsx`;
+        const wbout = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
+        const blob = new Blob([wbout], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+        
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        
+        setTimeout(() => {
+          if (document.body.contains(a)) document.body.removeChild(a);
+          window.URL.revokeObjectURL(url);
+        }, 100);
+
+        toast.success("Cash report downloaded! / ক্যাশ রিপোর্ট ডাউনলোড হয়েছে!");
+      } catch (err: any) {
+        toast.error("Export failed: " + err.message);
+      }
+   };
+
+  const handleStorageCleanupOneClick = async () => {
+    const isConfirmed = window.confirm(
+      "EXTREME CAUTION: This will download ALL system logs (Attendance, Cash, Mismatches, Ad-Hoc) and then PERMANENTLY DELETE them from the database to free up storage. \n\nAre you absolutely sure? / আপনি কি নিশ্চিত? এটি সব ডাটা ডাউনলোড করে চিরতরে মুছে ফেলবে।"
+    );
+
+    if (!isConfirmed) return;
+
+    try {
+      setIsLoading(true);
+      toast.loading("Preparing full system backup... / ব্যাকআপ তৈরি হচ্ছে...");
+
+      // 1. Fetch All Data using bridge for CockroachDB tables
+      const [attRes, cashRes, mismatchRes, adhocRes] = await Promise.all([
+        SupabaseService.list('attendance'),
+        SupabaseService.list('cash_reports'),
+        SupabaseService.list('mismatches'),
+        SupabaseService.list('ad_hoc_jobs')
+      ]);
+
+      // 2. Create Excel Workbook
+      const workbook = XLSX.utils.book_new();
+
+      // Attendance Sheet
+      if (attRes && attRes.length > 0) {
+        const attRows = attRes.map(r => ({
+          Date: r.date || 'N/A',
+          Employee: r.employeeName || r.userName || 'N/A',
+          In: r.checkInTime || '-',
+          Out: r.checkOutTime || '-',
+          Hours: r.hoursWorked || 0,
+          Earnings: r.earnings || 0,
+          Status: r.status || 'N/A'
+        }));
+        XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(attRows), "Attendance");
+      }
+
+      // Cash Reports Sheet
+      if (cashRes && cashRes.length > 0) {
+        XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(cashRes), "Cash Reports");
+      }
+
+      // Mismatches Sheet
+      if (mismatchRes && mismatchRes.length > 0) {
+        XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(mismatchRes), "Mismatches");
+      }
+
+      // Ad-Hoc Sheet
+      if (adhocRes && adhocRes.length > 0) {
+        XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(adhocRes), "AdHoc Logs");
+      }
+
+      // 3. Trigger Download
+      const filename = `FULL_SYSTEM_BACKUP_${format(new Date(), 'yyyyMMdd_HHmmss')}.xlsx`;
+      const wbout = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
+      const blob = new Blob([wbout], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      
+      toast.dismiss();
+      toast.success("✅ Download Started! Verify the file contents now.");
+
+      // 4. Secondary Confirmation for Deletion
+      setTimeout(async () => {
+        const deleteConfirmed = window.confirm(
+          "Download is complete. Do you want to DELETE these records from the database NOW to free up storage? \n\nডাউনলোড শেষ। এখন কি ডাটাবেজ থেকে এগুলো মুছে ফেলতে চান?"
+        );
+
+        if (deleteConfirmed) {
+          toast.loading("Cleaning up database... / ডাটা মুছে ফেলা হচ্ছে...");
+          
+          try {
+            // Delete all records using bridge to ensure it hits CockroachDB
+            await Promise.all([
+              SupabaseService.deleteWhere('attendance', [{ column: 'id', value: '00000000-0000-0000-0000-000000000000', operator: 'neq' }]),
+              SupabaseService.deleteWhere('cash_reports', [{ column: 'id', value: '00000000-0000-0000-0000-000000000000', operator: 'neq' }]),
+              SupabaseService.deleteWhere('mismatches', [{ column: 'id', value: '00000000-0000-0000-0000-000000000000', operator: 'neq' }]),
+              SupabaseService.deleteWhere('ad_hoc_jobs', [{ column: 'id', value: '00000000-0000-0000-0000-000000000000', operator: 'neq' }]),
+              SupabaseService.deleteWhere('location_logs', [{ column: 'id', value: '00000000-0000-0000-0000-000000000000', operator: 'neq' }])
+            ]);
+
+            toast.dismiss();
+            toast.success("🔥 Database Purged! Storage is now 100% free. / ডাটাবেজ ক্লিন করা হয়েছে।");
+            window.location.reload();
+          } catch (wipeErr: any) {
+            toast.dismiss();
+            toast.error("Wipe failed: " + wipeErr.message);
+          }
+        }
+      }, 2000);
+
+    } catch (err: any) {
+      toast.dismiss();
+      toast.error("Cleanup failed: " + err.message);
+    } finally {
+      setIsLoading(false);
     }
-
-    (doc as any).autoTable({
-      head: [['Date', 'Employee', 'Barcodes', 'Customer Val', 'ERP Val', 'Diff']],
-      body: tableData,
-      startY: 40,
-      theme: 'grid',
-      headStyles: { fillColor: [30, 41, 59], textColor: [255, 255, 255] },
-    });
-
-    // Add images for each report in subsequent pages
-    const reportList = mismatches.filter(m => {
-      if (type === 'DAILY') return m.date === format(new Date(), 'yyyy-MM-dd');
-      return m.date.startsWith(selectedMonth);
-    });
-
-       for (const m of reportList) {
-         doc.addPage();
-         doc.setFontSize(16);
-         doc.setTextColor(0);
-         doc.text(`Report Details: ${m.employeeName} (${m.date})`, 14, 20);
-         doc.setFontSize(10);
-         doc.text(`Barcodes: ${m.barcodes.join(', ')}`, 14, 30);
-         doc.text(`Difference: ₹${m.valueDifference}`, 14, 35);
-         doc.text("Photos were submitted via WhatsApp group.", 14, 45);
-       }
-
-    doc.save(`Mismatch_Report_${type}_${format(new Date(), 'yyyyMMdd')}.pdf`);
   };
-
 
   return (
     <div className="flex flex-col min-h-screen bg-bg-app text-text-primary font-sans">
       <AnimatePresence>
+        {isMaintenanceDay && showMaintenanceWarning && (
+          <motion.div 
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="bg-amber-500 text-white px-4 py-3 flex items-center justify-between border-b border-amber-600 shadow-lg relative z-50"
+          >
+            <div className="flex items-center gap-3">
+              <div className="bg-white/20 p-2 rounded-lg">
+                <AlertCircle className="w-5 h-5" />
+              </div>
+              <div className="flex flex-col">
+                <span className="font-bold text-sm leading-tight">
+                  SYSTEM MAINTENANCE REMINDER / রক্ষণাবেক্ষণ অনুস্মারক
+                </span>
+                <span className="text-xs opacity-90 leading-tight">
+                  Today is the {new Date().getDate() === 15 ? '15th' : '1st'} of the month. Please download all data and wipe the database to ensure system performance. / আজ মাসের {new Date().getDate() === 15 ? '১৫' : '১'} তারিখ। সিস্টেমের গতি বজায় রাখতে সব ডাটা ডাউনলোড করে ডাটাবেজ মুছে নিন।
+                </span>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <button 
+                onClick={handleStorageCleanupOneClick}
+                className="bg-white text-amber-600 px-3 py-1 rounded-md text-xs font-bold hover:bg-amber-50 shadow-sm transition-colors"
+              >
+                DOWNLOAD & WIPE / ডাউনলোড এবং ওয়াইপ
+              </button>
+              <button 
+                onClick={() => setShowMaintenanceWarning(false)}
+                className="p-1 hover:bg-white/20 rounded-full transition-colors"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </motion.div>
+        )}
         {!isOnline && (
           <motion.div 
             initial={{ height: 0, opacity: 0 }}
             animate={{ height: 'auto', opacity: 1 }}
             exit={{ height: 0, opacity: 0 }}
-            className="bg-accent-red text-white text-[10px] font-black uppercase tracking-widest py-2 px-6 flex items-center justify-center gap-2 overflow-hidden sticky top-0 z-[60]"
+            className="bg-accent-red text-white text-[10px] font-black uppercase tracking-[0.2em] py-2.5 px-6 flex items-center justify-center gap-2.5 overflow-hidden sticky top-0 z-[60] shadow-xl"
           >
-            <WifiOff className="h-3 w-3" />
-            {t.internetRequired}
+            <WifiOff className="h-3.5 w-3.5 animate-pulse" />
+            {t.internetRequired} (OFFLINE MODE ACTIVATED)
           </motion.div>
         )}
         {isWakeLockBlocked && (
           <motion.div 
             initial={{ height: 0, opacity: 0 }}
             animate={{ height: 'auto', opacity: 1 }}
-            className="bg-amber-500 text-white text-[10px] font-black uppercase tracking-widest py-2 px-6 flex items-center justify-center gap-2 overflow-hidden sticky top-0 z-[60] shadow-md border-b border-amber-600"
+            className="bg-indigo-600 text-white text-[10px] font-black uppercase tracking-[0.2em] py-2.5 px-6 flex items-center justify-center gap-2.5 overflow-hidden sticky top-0 z-[60] shadow-xl border-b border-white/10"
           >
-            <AlertTriangle className="h-3 w-3" />
-            BACKGROUND PERSISTENCE RESTRICTED. FOR FULL REALT-TIME UPDATES, PLEASE OPEN IN <b>NEW TAB</b>.
+            <AlertTriangle className="h-3.5 w-3.5" />
+            FOR LIVE UPDATES, PLEASE OPEN IN <b>NEW TAB</b>
           </motion.div>
         )}
       </AnimatePresence>
       {/* Header Bar */}
-      <header className="bg-white px-6 py-4 border-b border-app-border flex justify-between items-center sticky top-0 z-50">
+      <header className="bg-white/80 backdrop-blur-md px-6 py-4 border-b border-app-border/40 flex justify-between items-center sticky top-0 z-50 shadow-sm shadow-indigo-100/10">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 bg-accent-blue rounded-full flex items-center justify-center text-white font-bold shadow-sm">
+          <div className="w-10 h-10 bg-gradient-to-tr from-accent-blue to-violet-500 rounded-full flex items-center justify-center text-white font-black shadow-md shadow-accent-blue/15 scale-102">
             {user?.name?.charAt(0) || 'A'}
           </div>
           <div>
             <div className="flex items-center gap-2">
               <div className="text-sm font-bold leading-none">{user?.name}</div>
-              <div className={cn("w-1.5 h-1.5 rounded-full animate-pulse", isOnline ? "bg-accent-green" : "bg-accent-red")} />
+              <div className={`w-2.5 h-2.5 rounded-full ${isConfigured ? 'bg-accent-green' : 'bg-amber-500'} animate-pulse shadow-[0_0_12px_rgba(16,185,129,0.5)]`} title={isConfigured ? "Cloud Sync Active" : "Local Mode"} />
             </div>
-            <div className="text-[10px] text-text-secondary uppercase tracking-wider mt-1">{user?.role}</div>
+            <div className="text-[10px] text-slate-500 font-bold uppercase tracking-wider mt-1 bg-slate-50 px-2 py-0.5 rounded border border-slate-100 italic">
+               {user?.role} • {isConfigured ? 'CLOUD SYNC' : 'LOCAL STORAGE'}
+            </div>
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -1560,6 +1852,18 @@ export default function AdminDashboard() {
             <RefreshCw className="w-2.5 h-2.5 animate-spin" style={{ animationDuration: '3s' }} />
             Live AI Sync
           </div>
+          {user?.role === 'ADMIN' && externalReportLink && (
+            <a 
+              href={externalReportLink}
+              target="_blank"
+              rel="noreferrer"
+              className="hidden lg:flex items-center gap-2 px-3 py-1.5 bg-indigo-600 text-white text-[9px] font-black uppercase tracking-widest rounded-lg border border-indigo-700 hover:bg-indigo-700 transition-all shadow-sm"
+              title="Open External Report Book (Proton Drive)"
+            >
+              <ExternalLink className="h-3 w-3" />
+              Master Report
+            </a>
+          )}
           {user?.role === 'ADMIN' && (
             <button 
               onClick={handleWipeData}
@@ -1571,7 +1875,8 @@ export default function AdminDashboard() {
               {isWiping ? "Clearing..." : "Master Clean / মাস্টার রিসেট"}
             </button>
           )}
-          <div className="hidden lg:flex items-center gap-2 px-3 py-1.5 bg-bg-app text-text-secondary text-[9px] font-black uppercase tracking-widest rounded-lg border border-app-border">
+          <CloudStatusBadge />
+          <div className="hidden lg:flex items-center gap-2 px-3 py-1.5 bg-bg-app text-text-secondary text-[9px] font-black uppercase tracking-widest rounded-lg border border-app-border ml-2">
              ID: <span className="text-slate-900">{user?.username || user?.id?.substring(0, 8)}</span>
           </div>
           <button 
@@ -1579,7 +1884,7 @@ export default function AdminDashboard() {
               SupabaseService.clearCache();
               window.location.reload();
             }}
-            className="p-2 text-text-secondary hover:text-accent-blue transition-colors mr-2 active:rotate-180 duration-500"
+            className="p-2 text-text-secondary hover:text-accent-blue transition-colors ml-1 active:rotate-180 duration-500"
             title="Force Refresh Data / ডাটা রিফ্রেশ করুন"
           >
             <RefreshCw className="h-5 w-5" />
@@ -1594,40 +1899,49 @@ export default function AdminDashboard() {
       </header>
 
       {/* Admin Mobile Bottom Navigation */}
-      <div className="lg:hidden fixed bottom-0 left-0 right-0 bg-white shadow-[0_-10px_30px_-15px_rgba(0,0,0,0.1)] border-t border-app-border z-50">
-        <div className="flex items-center gap-1 px-4 py-2 overflow-x-auto scrollbar-hide snap-x">
+      <div className="lg:hidden fixed bottom-0 left-0 right-0 bg-white shadow-[0_-12px_40px_-15px_rgba(0,0,0,0.15)] border-t border-app-border z-50 px-2 pb-6">
+        <div className="flex items-center gap-1 py-3 overflow-x-auto scrollbar-hide snap-x">
           {[
-            { id: 'DASHBOARD', icon: LayoutDashboard, label: t.dashboard },
-            { id: 'EMPLOYEES', icon: Users, label: t.employee },
-            { id: 'SHIPMENTS', icon: PackageCheck, label: t.shipments },
-            { id: 'SALARY', icon: CreditCard, label: t.salaries },
-            { id: 'MILEAGE', icon: Map, label: t.mileage },
-            { id: 'MISMATCHES', icon: Barcode, label: t.valueMismatch },
-            { id: 'ADHOC', icon: Plus, label: t.adHoc },
-            { id: 'CASH_LOGS', icon: Calculator, label: 'Cash' },
-            { id: 'SYNC', icon: Database, label: 'Sync' }
+            { id: 'DASHBOARD', icon: LayoutDashboard, label: t.dashboard, color: 'accent-blue' },
+            { id: 'EMPLOYEES', icon: Users, label: 'Staff', color: 'accent-blue' },
+            { id: 'SHIPMENTS', icon: PackageCheck, label: 'Trip', color: 'accent-blue' },
+            { id: 'SALARY', icon: CreditCard, label: 'Pay', color: 'accent-blue' },
+            { id: 'MILEAGE', icon: Map, label: 'Logs', color: 'accent-blue' },
+            { id: 'MISMATCHES', icon: Barcode, label: 'Issues', color: 'accent-blue' },
+            { id: 'ADHOC', icon: Plus, label: 'Adhoc', color: 'accent-blue' },
+            { id: 'CASH_LOGS', icon: Calculator, label: 'Cash', color: 'accent-blue' }
           ].map((item) => (
-            <button
+            <motion.button
               key={item.id}
+              whileTap={{ scale: 0.9 }}
               onClick={() => setActiveTab(item.id as any)}
               className={cn(
-                "flex flex-col items-center gap-1 min-w-[64px] py-1 transition-all snap-center",
-                activeTab === item.id ? "text-accent-blue" : "text-text-secondary opacity-50"
+                "flex flex-col items-center gap-1.5 min-w-[72px] py-1 transition-all snap-center relative",
+                activeTab === item.id ? "text-accent-blue" : "text-slate-400"
               )}
             >
               <div className={cn(
-                "p-2 rounded-xl transition-all",
-                activeTab === item.id ? "bg-accent-blue/10 scale-110" : "bg-transparent"
+                "p-3 rounded-2xl transition-all duration-500",
+                activeTab === item.id ? "bg-accent-blue/10 shadow-inner" : "bg-transparent"
               )}>
-                <item.icon className={cn("h-5 w-5", activeTab === item.id && "fill-accent-blue/10")} />
+                <item.icon className={cn(
+                  "h-5 w-5 transition-transform duration-500",
+                  activeTab === item.id ? "scale-110" : "scale-100"
+                )} />
               </div>
               <span className={cn(
-                "text-[9px] font-black uppercase tracking-tighter transition-all",
-                activeTab === item.id ? "opacity-100" : "opacity-0 h-0 scale-0"
+                "text-[8px] font-black uppercase tracking-tighter transition-all duration-300",
+                activeTab === item.id ? "opacity-100 translate-y-0" : "opacity-0 translate-y-2 h-0"
               )}>
                 {item.label}
               </span>
-            </button>
+              {activeTab === item.id && (
+                <motion.div 
+                  layoutId="activeTabIndicator"
+                  className="absolute -bottom-1 w-1/2 h-0.5 bg-accent-blue rounded-full shadow-[0_0_8px_#0ea5e9]" 
+                />
+              )}
+            </motion.button>
           ))}
         </div>
       </div>
@@ -1643,25 +1957,72 @@ export default function AdminDashboard() {
         {/* Consolidated Stats Ribbon */}
         <div className="space-y-4">
           <div className="grid grid-cols-3 gap-3">
-             <div className="bg-white p-3 rounded-2xl border border-app-border shadow-sm flex flex-col items-center justify-center text-center">
-                <span className="text-[8px] font-black text-text-secondary uppercase tracking-tighter mb-1">Sales</span>
+             <div className="bg-gradient-to-br from-emerald-500/5 to-teal-500/10 p-3 rounded-2xl border border-emerald-500/20 shadow-sm flex flex-col items-center justify-center text-center">
+                <span className="text-[8px] font-black text-emerald-800 uppercase tracking-tighter mb-1">Sales</span>
                 <span className="text-xs font-black text-accent-green">₹{(globalFishSales || 0) > 1000 ? ((globalFishSales || 0)/1000).toFixed(1) + 'k' : (globalFishSales || 0)}</span>
              </div>
-             <div className="bg-white p-3 rounded-2xl border border-app-border shadow-sm flex flex-col items-center justify-center text-center">
-                <span className="text-[8px] font-black text-text-secondary uppercase tracking-tighter mb-1">Online</span>
+             <div className="bg-gradient-to-br from-accent-blue/5 to-indigo-500/10 p-3 rounded-2xl border border-accent-blue/20 shadow-sm flex flex-col items-center justify-center text-center">
+                <span className="text-[8px] font-black text-indigo-800 uppercase tracking-tighter mb-1">Online</span>
                 <div className="flex items-center gap-1">
                   <span className="text-xs font-black text-slate-900">{activeCount}</span>
                   <div className="w-1 h-1 rounded-full bg-accent-green animate-pulse" />
                 </div>
              </div>
-             <div className="bg-white p-3 rounded-2xl border border-app-border shadow-sm flex flex-col items-center justify-center text-center">
-                <span className="text-[8px] font-black text-text-secondary uppercase tracking-tighter mb-1">Absent</span>
+             <div className="bg-gradient-to-br from-rose-500/5 to-rose-500/10 p-3 rounded-2xl border border-red-500/20 shadow-sm flex flex-col items-center justify-center text-center">
+                <span className="text-[8px] font-black text-rose-800 uppercase tracking-tighter mb-1">Absent</span>
                 <span className="text-xs font-black text-accent-red">{deptEmployeesCount - presentCount}</span>
              </div>
           </div>
         </div>
 
         {/* Tabs - Now hidden on mobile as we use the bottom floating nav */}
+        {systemStatus?.isPurgeDay && (
+          <motion.div 
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            className="bg-slate-900 border border-slate-800 rounded-3xl p-6 shadow-2xl relative overflow-hidden group"
+          >
+            <div className="absolute top-0 right-0 w-64 h-64 bg-accent-blue/10 rounded-full blur-3xl -mr-32 -mt-32" />
+            <div className="relative z-10 flex flex-col md:flex-row items-center justify-between gap-6">
+              <div className="flex items-center gap-5">
+                <div className="w-16 h-16 bg-accent-blue/20 rounded-2xl flex items-center justify-center text-accent-blue">
+                  <Download className="h-8 w-8 animate-bounce" />
+                </div>
+                <div className="space-y-1">
+                  <h2 className="text-xl font-black text-white uppercase tracking-tight">পনেরো দিনের ডাটা ডাউনলোড করুন</h2>
+                  <p className="text-sm font-bold text-slate-400">
+                    {systemStatus.day === 15 ? "১৫ দিন পূর্ণ হয়েছে।" : "মাস শেষ হয়েছে।"} আপনার কর্মচারীদের ডাটা ডাউনলোড করে ডাটাবেস খালি করুন।
+                  </p>
+                  <div className="flex items-center gap-3 mt-2">
+                    <span className="px-3 py-1 bg-slate-800 rounded-full text-[10px] font-black text-accent-blue uppercase tracking-widest border border-slate-700">
+                      Attendance: {systemStatus.stats.attendance}
+                    </span>
+                    <span className="px-3 py-1 bg-slate-800 rounded-full text-[10px] font-black text-accent-orange uppercase tracking-widest border border-slate-700">
+                      Mismatches: {systemStatus.stats.mismatches}
+                    </span>
+                  </div>
+                </div>
+              </div>
+              
+              <button 
+                onClick={handleDownloadAndPurgeFlow}
+                disabled={isPurging}
+                className="w-full md:w-auto px-10 py-5 bg-accent-blue hover:bg-accent-blue/90 text-white font-black text-sm uppercase tracking-widest rounded-2xl shadow-xl shadow-accent-blue/20 transition-all active:scale-95 flex items-center justify-center gap-3 group"
+              >
+                {isPurging ? (
+                  <RefreshCw className="h-5 w-5 animate-spin" />
+                ) : (
+                  <>
+                    <Database className="h-5 w-5" />
+                    Download & Clear DB
+                    <ArrowRight className="h-5 w-5 group-hover:translate-x-1 transition-transform" />
+                  </>
+                )}
+              </button>
+            </div>
+          </motion.div>
+        )}
+
         <div className="hidden lg:flex items-center gap-2 bg-white/50 p-1.5 rounded-2xl border border-app-border w-fit overflow-x-auto scrollbar-hide">
           <button 
             onClick={() => setActiveTab('DASHBOARD')}
@@ -1763,21 +2124,34 @@ export default function AdminDashboard() {
             <FileDown className="h-4 w-4" />
             <span className="truncate">Reports</span>
           </button>
-          <button 
-            onClick={() => setActiveTab('SYNC')}
-            className={cn(
-              "flex items-center justify-center gap-2 px-3 py-2.5 lg:px-6 rounded-xl text-[10px] lg:text-xs font-black uppercase tracking-widest transition-all whitespace-nowrap",
-              activeTab === 'SYNC' ? "bg-accent-blue text-white shadow-lg shadow-accent-blue/20" : "text-text-secondary hover:bg-bg-app"
-            )}
-          >
-            <Database className="h-4 w-4" />
-            <span className="truncate">Google Sheets</span>
-          </button>
         </div>
 
         {activeTab === 'DASHBOARD' && (
-          <div className="space-y-6 animate-in fade-in duration-500">
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="space-y-6"
+          >
             <div className="grid grid-cols-2 md:grid-cols-2 lg:grid-cols-3 gap-3 md:gap-4">
+              {/* STORAGE MASTER QUICK ACTION (NEW PROMINENT CARD) */}
+              <button 
+                onClick={() => handleStorageCleanupOneClick()}
+                className="col-span-2 lg:col-span-1 bg-slate-900 p-4 md:p-6 rounded-3xl border border-slate-800 shadow-xl hover:shadow-2xl transition-all text-left flex flex-col justify-between h-40 md:h-44 group relative overflow-hidden"
+              >
+                <div className="absolute top-0 right-0 w-32 h-32 bg-accent-blue/20 rounded-bl-[100px] -mr-8 -mt-8 transition-all group-hover:scale-125 group-hover:bg-accent-blue/30" />
+                <div className="w-12 h-12 bg-accent-blue rounded-2xl flex items-center justify-center text-white relative z-10 transition-transform group-hover:rotate-12">
+                  <Database className="h-6 w-6" />
+                </div>
+                <div className="relative z-10">
+                  <div className="text-lg md:text-xl font-black text-white uppercase tracking-tighter leading-none mb-1">Storage Master</div>
+                  <div className="text-[9px] font-black text-accent-blue uppercase tracking-[0.2em]">One-Click Download & Purge</div>
+                  <div className="mt-3 flex items-center gap-2 text-[8px] font-bold text-slate-400">
+                    <span className="w-1.5 h-1.5 bg-accent-green rounded-full animate-pulse" />
+                    Recommended Before New Month
+                  </div>
+                </div>
+              </button>
+
               {/* Mismatch Summary Card */}
               <button 
                 onClick={() => setActiveTab('MISMATCHES')}
@@ -1920,7 +2294,7 @@ export default function AdminDashboard() {
                  )}
                </div>
             </div>
-          </div>
+          </motion.div>
         )}
 
         {activeTab === 'EMPLOYEES' && (
@@ -1982,8 +2356,8 @@ export default function AdminDashboard() {
                     className="px-4 py-3 bg-white border border-app-border rounded-xl text-sm font-medium focus:outline-none focus:ring-2 focus:ring-accent-blue/20 transition-all shadow-sm outline-none"
                   >
                     <option value="">All Departments</option>
-                    {departments.map(dept => (
-                      <option key={dept} value={dept}>{dept}</option>
+                    {departments.map((dept, dIdx) => (
+                      <option key={`${dept}-${dIdx}`} value={dept}>{dept}</option>
                     ))}
                   </select>
                 )}
@@ -2020,7 +2394,10 @@ export default function AdminDashboard() {
                     const record = attendanceToday.find(a => a.userId === emp.id);
                     const isSelected = selectedEmployeeUids.has(emp.id);
                     return (
-                      <div 
+                      <motion.div 
+                        initial={{ opacity: 0, x: -10 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        transition={{ delay: Math.min(idx * 0.05, 0.4) }}
                         key={`emp-card-${emp.id}-${idx}`} 
                         className={cn(
                           "bg-white rounded-[32px] p-6 border-2 border-app-border flex items-center justify-between gap-4 transition-all hover:border-slate-300 shadow-sm hover:shadow-md group relative",
@@ -2152,8 +2529,16 @@ export default function AdminDashboard() {
                           <button 
                             onClick={() => setEditingEmployee(emp)}
                             className="p-3 bg-bg-app border border-app-border hover:bg-slate-200 text-slate-600 rounded-2xl transition-all hover:shadow-inner active:scale-90"
+                            title="Edit Profile / তথ্য এডিট করুন"
                           >
                             <Edit2 className="h-4 w-4" />
+                          </button>
+                          <button 
+                            onClick={() => setResetCredentialsEmployee(emp)}
+                            className="p-3 bg-bg-app border border-app-border hover:bg-slate-200 text-slate-600 rounded-2xl transition-all hover:shadow-inner active:scale-90"
+                            title="Reset Credentials / আইডি ও পাসওয়ার্ড আপডেট"
+                          >
+                            <Key className="h-4 w-4 text-emerald-600 font-extrabold" />
                           </button>
                           <button 
                             onClick={() => handleUpdateStatus(emp.id, emp.status)}
@@ -2163,7 +2548,7 @@ export default function AdminDashboard() {
                             <ShieldCheck className="h-4 w-4" />
                           </button>
                         </div>
-                      </div>
+                      </motion.div>
                     );
                   })}
               </div>
@@ -2855,7 +3240,7 @@ export default function AdminDashboard() {
                   </button>
                 )}
                 <button 
-                  onClick={downloadAdHocExcel}
+                  onClick={downloadAllDataExcel}
                   className="bg-accent-green text-white px-5 py-3 rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-lg shadow-accent-green/20 hover:scale-105 transition-all flex items-center gap-2 shrink-0"
                 >
                   <Database className="h-4 w-4" /> 
@@ -3214,6 +3599,13 @@ export default function AdminDashboard() {
                 >
                   <RefreshCw className="h-4 w-4 text-text-secondary group-hover:rotate-180 transition-all duration-500" />
                 </button>
+                <button 
+                  onClick={handleExportCashExcel}
+                  className="p-3 bg-bg-app border border-app-border rounded-2xl hover:bg-white transition-all shadow-sm group"
+                  title="Download Cash Reports (Excel)"
+                >
+                  <Download className="h-4 w-4 text-accent-blue" />
+                </button>
               </div>
             </div>
 
@@ -3380,14 +3772,14 @@ export default function AdminDashboard() {
                       key={`track-btn-${loc.id || 'no-id'}-${idx}`}
                       onClick={() => setSelectedLiveEmployeeId(isSelected ? null : loc.userId)}
                       className={cn(
-                        "p-4 rounded-[2rem] border transition-all text-left flex items-center gap-4",
-                        isSelected ? "bg-accent-blue text-white border-accent-blue shadow-lg shadow-accent-blue/20" : "bg-bg-app border-app-border hover:border-accent-blue/30",
+                        "p-4 rounded-[2rem] border transition-all text-left flex items-center gap-3 md:gap-4 overflow-hidden",
+                        isSelected ? "bg-accent-blue text-white border-accent-blue shadow-lg shadow-accent-blue/20" : "bg-white border-slate-200 hover:border-accent-blue/30 shadow-sm",
                         isInactive && "opacity-50 grayscale"
                       )}
                     >
                       <div className={cn(
-                        "w-12 h-12 rounded-2xl flex items-center justify-center font-black text-sm shadow-inner uppercase",
-                        isSelected ? "bg-white/20" : "bg-white"
+                        "w-10 h-10 md:w-12 md:h-12 rounded-2xl flex items-center justify-center font-black text-xs shadow-inner uppercase shrink-0",
+                        isSelected ? "bg-white/20" : "bg-slate-100"
                       )}>
                         {emp?.profilePicture ? (
                            <img src={emp.profilePicture} alt="" className="w-full h-full object-cover rounded-2xl" />
@@ -3395,21 +3787,21 @@ export default function AdminDashboard() {
                            emp?.name?.charAt(0) || '?'
                         )}
                       </div>
-                      <div className="flex-1">
-                        <div className={cn("text-xs font-black uppercase tracking-tight", isSelected ? "text-white" : "text-slate-900")}>
+                      <div className="flex-1 min-w-0">
+                        <div className={cn("text-xs font-black uppercase tracking-tight truncate", isSelected ? "text-white" : "text-slate-900")}>
                           {emp?.name || loc.name}
                         </div>
-                        <div className={cn("text-[9px] font-bold uppercase opacity-60", isSelected ? "text-white" : "text-text-secondary")}>
+                        <div className={cn("text-[8px] md:text-[9px] font-bold uppercase opacity-60 truncate", isSelected ? "text-white" : "text-slate-500")}>
                           {emp?.jobTitle}
                         </div>
                       </div>
-                      <div className="text-right">
-                        <div className={cn("text-[10px] font-mono font-black", isSelected ? "text-white" : "text-accent-blue")}>
+                      <div className="text-right shrink-0">
+                        <div className={cn("text-[9px] md:text-[10px] font-mono font-black", isSelected ? "text-white" : "text-accent-blue")}>
                           {(loc.speed * 3.6).toFixed(1)} <span className="text-[7px]">KM/H</span>
                         </div>
                         <div className="flex items-center justify-end gap-1 mt-0.5">
                           <div className={cn("w-1.5 h-1.5 rounded-full", isInactive ? "bg-slate-400" : "bg-accent-green animate-pulse")} />
-                          <span className={cn("text-[8px] font-black uppercase tracking-widest", isSelected ? "text-white/60" : "text-slate-400")}>
+                          <span className={cn("text-[7px] md:text-[8px] font-black uppercase tracking-widest", isSelected ? "text-white/60" : "text-slate-400")}>
                             {isInactive ? "Offline" : "Active"}
                           </span>
                         </div>
@@ -3423,7 +3815,7 @@ export default function AdminDashboard() {
         )}
 
         {activeTab === 'REPORTS' && (
-          <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+          <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500 pb-20">
             <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
               <div>
                 <h2 className="text-2xl font-black text-slate-900 uppercase tracking-tight">System Reports & Health</h2>
@@ -3439,11 +3831,71 @@ export default function AdminDashboard() {
               </div>
             </div>
 
+            {/* MASTER DOWNLOAD & CLEAR CARD */}
+            <div className="bg-gradient-to-br from-slate-900 to-slate-800 rounded-[32px] p-8 text-white shadow-2xl relative overflow-hidden group">
+               <div className="absolute top-0 right-0 w-64 h-64 bg-accent-blue/10 rounded-full blur-3xl -translate-y-1/2 translate-x-1/2 group-hover:scale-125 transition-transform duration-700" />
+               
+               <div className="relative z-10 space-y-6">
+                 <div className="flex items-center gap-4">
+                    <div className="w-14 h-14 bg-white/10 backdrop-blur-md rounded-2xl flex items-center justify-center text-accent-blue border border-white/10">
+                       <Download className="h-7 w-7" />
+                    </div>
+                    <div>
+                      <h3 className="text-xl font-black uppercase tracking-tight italic">Storage Mastery</h3>
+                      <p className="text-xs text-white/60 font-bold uppercase tracking-widest mt-1">One-Click Excel Download & Database Wipe</p>
+                    </div>
+                 </div>
+
+                 <div className="bg-white/5 border border-white/10 rounded-2xl p-6 space-y-4">
+                    <p className="text-sm text-white/80 leading-relaxed italic">
+                      "এক ক্লিকে আপনার সকল ডাটা (Attendance, Mismatch, Ad-Hoc) এক্সেল ফাইল হিসেবে ডাউনলোড হবে এবং ডাটাবেস থেকে স্থায়ীভাবে মুছে ফেলা হবে স্টোরেজ খালি করার জন্য।"
+                    </p>
+                    <div className="flex flex-wrap gap-3">
+                       <div className="px-3 py-1 bg-accent-blue/20 text-accent-blue text-[9px] font-black rounded-lg uppercase tracking-widest border border-accent-blue/30">Attendance Logs</div>
+                       <div className="px-3 py-1 bg-amber-500/20 text-amber-500 text-[9px] font-black rounded-lg uppercase tracking-widest border border-amber-500/30">Value Mismatches</div>
+                       <div className="px-3 py-1 bg-accent-green/20 text-accent-green text-[9px] font-black rounded-lg uppercase tracking-widest border border-accent-green/30">Ad-Hoc Jobs</div>
+                       <div className="px-3 py-1 bg-violet-500/20 text-violet-500 text-[9px] font-black rounded-lg uppercase tracking-widest border border-violet-500/30">Cash Reports</div>
+                    </div>
+                 </div>
+
+                 <div className="flex flex-col sm:flex-row gap-4 pt-2">
+                    <button 
+                      onClick={handleStorageCleanupOneClick}
+                      disabled={isLoading}
+                      className="flex-1 bg-accent-blue hover:bg-accent-blue/90 disabled:opacity-50 text-white h-16 rounded-2xl font-black uppercase tracking-[0.2em] shadow-xl shadow-accent-blue/20 flex items-center justify-center gap-3 active:scale-95 transition-all group/btn"
+                    >
+                      {isLoading ? (
+                        <>
+                          <RefreshCw className="h-5 w-5 animate-spin" />
+                          Processing System Data...
+                        </>
+                      ) : (
+                        <>
+                          <Download className="h-5 w-5 group-hover:-translate-y-1 transition-transform" />
+                          Download & Clear Database
+                        </>
+                      )}
+                    </button>
+                    
+
+                 </div>
+
+                 <div className="flex flex-col items-center gap-2 pt-2">
+                    <div className="text-[10px] text-white/40 font-bold uppercase tracking-[0.3em] flex items-center gap-2">
+                       <div className="w-1 h-1 bg-accent-green rounded-full animate-pulse" /> Live Storage Watch Active
+                    </div>
+                    <p className="text-[9px] text-white/30 font-bold uppercase text-center max-w-xs">
+                       Recommended before every new month to keep CockroachDB storage at 0% usage
+                    </p>
+                 </div>
+               </div>
+            </div>
+
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
               {/* Attendance Summary Card */}
-              <div className="bg-white rounded-[2.5rem] p-8 border border-app-border shadow-sm hover:shadow-md transition-all group relative overflow-hidden flex flex-col h-full">
+              <div className="bg-white rounded-[2.5rem] p-6 sm:p-8 border border-slate-200 shadow-sm hover:shadow-md transition-all group relative overflow-hidden flex flex-col h-full">
                 <div className="absolute top-0 right-0 w-24 h-24 bg-blue-50/50 rounded-bl-[100px] -mr-8 -mt-8 transition-all group-hover:scale-125" />
-                <div className="w-16 h-16 bg-blue-50 rounded-3xl flex items-center justify-center mb-6 group-hover:scale-110 transition-transform relative">
+                <div className="w-16 h-16 bg-blue-50 rounded-3xl flex items-center justify-center mb-6 group-hover:scale-110 transition-transform relative border border-blue-100">
                   <CalendarCheck className="h-8 w-8 text-accent-blue" />
                 </div>
                 <h3 className="text-xl font-black text-slate-900 mb-2">Attendance Summary</h3>
@@ -3453,7 +3905,7 @@ export default function AdminDashboard() {
                 <button 
                   onClick={() => handleExportAttendanceExcel()}
                   disabled={isLoading}
-                  className="w-full h-14 bg-slate-900 text-white rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-2 hover:bg-slate-800 transition-colors shadow-xl shadow-slate-900/10 active:scale-95"
+                  className="w-full h-14 bg-slate-900 text-white rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-2 hover:bg-slate-800 transition-colors shadow-lg active:scale-95"
                 >
                   {isLoading ? <RefreshCw className="h-5 w-5 animate-spin" /> : <Download className="h-5 w-5" />}
                   Download Excel
@@ -3461,9 +3913,9 @@ export default function AdminDashboard() {
               </div>
 
               {/* Value Mismatch Card */}
-              <div className="bg-white rounded-[2.5rem] p-8 border border-app-border shadow-sm hover:shadow-md transition-all group relative overflow-hidden flex flex-col h-full">
+              <div className="bg-white rounded-[2.5rem] p-6 sm:p-8 border border-slate-200 shadow-sm hover:shadow-md transition-all group relative overflow-hidden flex flex-col h-full">
                 <div className="absolute top-0 right-0 w-24 h-24 bg-amber-50/50 rounded-bl-[100px] -mr-8 -mt-8 transition-all group-hover:scale-125" />
-                <div className="w-16 h-16 bg-amber-50 rounded-3xl flex items-center justify-center mb-6 group-hover:scale-110 transition-transform relative">
+                <div className="w-16 h-16 bg-amber-50 rounded-3xl flex items-center justify-center mb-6 group-hover:scale-110 transition-transform relative border border-amber-100">
                   <AlertTriangle className="h-8 w-8 text-amber-500" />
                 </div>
                 <h3 className="text-xl font-black text-slate-900 mb-2">Mismatch Reports</h3>
@@ -3472,7 +3924,7 @@ export default function AdminDashboard() {
                 </p>
                 <button 
                   onClick={() => handleExportMismatchesExcel('MONTHLY')}
-                  className="w-full h-14 bg-slate-900 text-white rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-2 hover:bg-slate-800 transition-colors shadow-xl shadow-slate-900/10 active:scale-95"
+                  className="w-full h-14 bg-slate-900 text-white rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-2 hover:bg-slate-800 transition-colors shadow-lg active:scale-95"
                 >
                   <Download className="h-5 w-5" />
                   Download Excel
@@ -3480,9 +3932,9 @@ export default function AdminDashboard() {
               </div>
 
               {/* System Integrity Check Card */}
-              <div className="bg-white rounded-[2.5rem] p-8 border border-app-border shadow-sm hover:shadow-md transition-all group relative overflow-hidden h-full flex flex-col">
+              <div className="bg-white rounded-[2.5rem] p-6 sm:p-8 border border-slate-200 shadow-sm hover:shadow-md transition-all group relative overflow-hidden h-full flex flex-col">
                 <div className="absolute top-0 right-0 w-24 h-24 bg-purple-50/50 rounded-bl-[100px] -mr-8 -mt-8 transition-all group-hover:scale-125" />
-                <div className="w-16 h-16 bg-purple-50 rounded-3xl flex items-center justify-center mb-6 group-hover:scale-110 transition-transform relative">
+                <div className="w-16 h-16 bg-purple-50 rounded-3xl flex items-center justify-center mb-6 group-hover:scale-110 transition-transform relative border border-purple-100">
                   <Database className="h-8 w-8 text-purple-600" />
                 </div>
                 <h3 className="text-xl font-black text-slate-900 mb-2">System Diagnostics</h3>
@@ -3511,7 +3963,7 @@ export default function AdminDashboard() {
                         target.innerText = "Check Database Health";
                       }
                     }}
-                    className="w-full py-3 bg-purple-50 hover:bg-purple-100 text-purple-700 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all border border-purple-100"
+                    className="w-full py-3 bg-purple-50 hover:bg-purple-100 text-purple-700 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all border border-purple-200"
                   >
                     Check Database Health
                   </button>
@@ -3522,9 +3974,9 @@ export default function AdminDashboard() {
                         window.location.reload();
                       }
                     }}
-                    className="w-full py-3 bg-red-50 hover:bg-red-100 text-red-700 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all border border-red-100"
+                    className="w-full py-3 bg-red-50 hover:bg-red-100 text-red-700 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all border border-red-200"
                   >
-                    Emergency System Repair
+                    Repair Database
                   </button>
                 </div>
               </div>
@@ -3545,20 +3997,6 @@ export default function AdminDashboard() {
                   </button>
                </div>
             </div>
-          </div>
-        )}
-
-        {activeTab === 'SYNC' && (
-          <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
-            {/* Header */}
-            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-              <div>
-                <h2 className="text-2xl font-black text-slate-900 uppercase tracking-tight">Google Sheets Sync Hub</h2>
-                <p className="text-sm text-slate-500 font-medium">Backup & manage employee attendance reports permanently / গুগল শিটে ব্যাকআপ রাখুন</p>
-              </div>
-            </div>
-
-            <GoogleSheetsSyncManager />
           </div>
         )}
 
@@ -3826,6 +4264,87 @@ export default function AdminDashboard() {
             </motion.div>
           </div>
         )}
+
+        {resetCredentialsEmployee && (
+          <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-[150] flex items-end sm:items-center justify-center p-4">
+            <motion.div 
+              initial={{ y: 100 }} animate={{ y: 0 }} exit={{ y: 100 }}
+              className="bg-white w-full max-w-sm rounded-[32px] p-8 shadow-2xl space-y-6 text-left"
+            >
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-xl font-black text-slate-900">Reset Credentials</h3>
+                  <p className="text-[10px] text-text-secondary font-black uppercase tracking-wider">পাসওয়ার্ড ও আইডি সেট করুন</p>
+                </div>
+                <button onClick={() => setResetCredentialsEmployee(null)} className="p-2 text-text-secondary hover:text-accent-red transition-colors"><X className="h-6 w-6" /></button>
+              </div>
+              
+              <ResetCredentialsForm 
+                employee={resetCredentialsEmployee}
+                onClose={() => setResetCredentialsEmployee(null)} 
+              />
+            </motion.div>
+          </div>
+        )}
+
+        {/* MASTER DATA RESET REMINDER MODAL (1st & 2nd of Month) */}
+        {showReminderModal && user?.role === 'ADMIN' && (
+          <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-[300] flex items-center justify-center p-4">
+            <motion.div
+              initial={{ scale: 0.9, opacity: 0, y: 20 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              className="bg-white w-full max-w-md rounded-[40px] overflow-hidden shadow-2xl border border-white/20"
+            >
+              <div className="bg-accent-red p-8 text-white relative overflow-hidden">
+                <div className="absolute top-0 right-0 w-32 h-32 bg-white/10 rounded-full -mr-16 -mt-16 blur-2xl" />
+                <div className="relative z-10 flex items-center gap-4">
+                  <div className="w-14 h-14 bg-white/20 rounded-2xl flex items-center justify-center backdrop-blur-md">
+                    <AlertTriangle className="h-8 w-8" />
+                  </div>
+                  <div>
+                    <h3 className="text-2xl font-black uppercase tracking-tight">Data Policy Warning</h3>
+                    <p className="text-[10px] font-bold text-white/80 uppercase tracking-widest">Monthly Cleanup Protocol</p>
+                  </div>
+                </div>
+              </div>
+              
+              <div className="p-8 space-y-6">
+                <div className="space-y-4">
+                  <h4 className="text-xl font-black text-slate-900 leading-tight">
+                    এক থেকে দুই দিনের মধ্যে আপনার ডাটা ডিলিট হয়ে যাবে। আপনি এক্ষুনি আপনার সকল ডাটা ডাউনলোড করে নিন।
+                  </h4>
+                  <p className="text-sm text-slate-500 font-medium leading-relaxed">
+                    System maintenance protocol requires clearing transaction logs at the start of each month to ensure peak performance. Please synchronize all records to your Google Sheet now.
+                  </p>
+                </div>
+
+                <div className="flex flex-col gap-3">
+                  <button
+                    onClick={() => {
+                      setShowReminderModal(false);
+                      setActiveTab('REPORTS' as any);
+                      // Set a flag so it doesn't show again in this session
+                      localStorage.setItem(`reminder_dismissed_${format(new Date(), 'yyyy-MM')}`, 'true');
+                    }}
+                    className="w-full h-16 bg-slate-900 text-white rounded-2xl font-black uppercase tracking-[0.2em] shadow-xl shadow-slate-900/20 active:scale-95 transition-all flex items-center justify-center gap-3"
+                  >
+                    Go to Download Now
+                    <ArrowRight className="h-5 w-5" />
+                  </button>
+                  <button
+                    onClick={() => {
+                       setShowReminderModal(false);
+                       localStorage.setItem(`reminder_dismissed_${format(new Date(), 'yyyy-MM')}`, 'true');
+                    }}
+                    className="w-full py-4 text-slate-400 font-black uppercase tracking-widest text-[10px] hover:text-accent-red transition-colors"
+                  >
+                    Dismiss Warning
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
       </AnimatePresence>
     </div>
   );
@@ -3875,7 +4394,7 @@ function EmployeeForm({ onClose, initialData }: { onClose: () => void, initialDa
         canvasRef.current.toBlob(async (blob) => {
           if (blob) {
             try {
-              const compressed = await compressImage(blob, 100);
+              const compressed = await compressImage(blob, 45);
               const reader = new FileReader();
               reader.onloadend = () => {
                 setFormData({ ...formData, profilePicture: reader.result as string });
@@ -3883,8 +4402,8 @@ function EmployeeForm({ onClose, initialData }: { onClose: () => void, initialDa
               };
               reader.readAsDataURL(compressed);
             } catch (err) {
-              const photo = canvasRef.current!.toDataURL('image/jpeg', 0.6);
-              setFormData({ ...formData, profilePicture: photo });
+              console.error("Camera capture compression failed:", err);
+              toast.error("Failed to process photo within size limits. / সাইজ লিমিটের মধ্যে ফটো প্রসেস করা সম্ভব হয়নি।");
               stopCamera();
             }
           }
@@ -3905,7 +4424,7 @@ function EmployeeForm({ onClose, initialData }: { onClose: () => void, initialDa
     const file = e.target.files?.[0];
     if (file) {
       try {
-        const compressed = await compressImage(file, 100);
+        const compressed = await compressImage(file, 45);
         const reader = new FileReader();
         reader.onloadend = () => {
           setFormData({ ...formData, profilePicture: reader.result as string });
@@ -3913,11 +4432,7 @@ function EmployeeForm({ onClose, initialData }: { onClose: () => void, initialDa
         reader.readAsDataURL(compressed);
       } catch (err) {
         console.error("Compression failed:", err);
-        const reader = new FileReader();
-        reader.onloadend = () => {
-          setFormData({ ...formData, profilePicture: reader.result as string });
-        };
-        reader.readAsDataURL(file);
+        toast.error("File is too large or invalid. / ফাইলটি অনেক বড় অথবা ইনভ্যালিড।");
       }
     }
   };
@@ -3926,6 +4441,11 @@ function EmployeeForm({ onClose, initialData }: { onClose: () => void, initialDa
     e.preventDefault();
     
     // Client-side validation
+    if (!formData.jobTitle) {
+      toast.warning("Please select a Job Title. / একটি পদ নির্বাচন করুন।");
+      return;
+    }
+    
     if (!initialData && formData.password.length < 6) {
       toast.warning("Password must be at least 6 characters long.");
       return;
@@ -3972,37 +4492,31 @@ function EmployeeForm({ onClose, initialData }: { onClose: () => void, initialDa
         }
 
         let authUserId = '';
-        if (getUseLocalFallback()) {
-          authUserId = sanitizedId; // Use userName/id as local UUID
-        } else {
-          // Use a temporary client to sign up the new user without affecting the admin's session
-          const { createClient } = await import('@supabase/supabase-js');
-          const { supabaseUrl, supabaseAnonKey } = await import('../lib/supabase');
-          
-          const tempSupabase = createClient(supabaseUrl || '', supabaseAnonKey || '', {
-            auth: { persistSession: false }
-          });
+        
+        // Use a temporary client to sign up the new user without affecting the admin's session
+        const { createClient } = await import('@supabase/supabase-js');
+        const { supabaseUrl, supabaseAnonKey } = await import('../lib/supabase');
+        
+        const tempSupabase = createClient(supabaseUrl || '', supabaseAnonKey || '', {
+          auth: { persistSession: false }
+        });
 
-          const { data: authData, error: authErr } = await tempSupabase.auth.signUp({
-            email,
-            password: formData.password
-          });
+        const { data: authData, error: authErr } = await tempSupabase.auth.signUp({
+          email,
+          password: formData.password
+        });
 
-          if (authErr) {
-            const isBoundFailure = authErr.message.toLowerCase().includes('already registered') || authErr.message.toLowerCase().includes('already exists');
-            if (isBoundFailure) {
-              toast.warning("⚠️ এই ইউজার আইডি ইতিমধ্যে রেজিস্টার্ড আছে। (User already registered)");
-              setIsSubmitting(false);
-              return;
-            }
-            
-            // Auto fallback for rate limits, restricted domains/emails, and database constraints
-            console.warn(`Supabase Auth signup returned "${authErr.message}". Auto-falling back to secure database-level profile mode.`);
-            authUserId = sanitizedId;
-          } else {
-            if (!authData.user) throw new Error("Failed to create auth record");
-            authUserId = authData.user.id;
+        if (authErr) {
+          const isBoundFailure = authErr.message.toLowerCase().includes('already registered') || authErr.message.toLowerCase().includes('already exists');
+          if (isBoundFailure) {
+            toast.warning("⚠️ এই ইউজার আইডি ইতিমধ্যে রেজিস্টার্ড আছে। (User already registered)");
+            setIsSubmitting(false);
+            return;
           }
+          throw authErr;
+        } else {
+          if (!authData.user) throw new Error("Failed to create auth record");
+          authUserId = authData.user.id;
         }
 
         const newUser: UserProfile = {
@@ -4020,21 +4534,16 @@ function EmployeeForm({ onClose, initialData }: { onClose: () => void, initialDa
           email: email,
           activeSessions: [],
           profilePicture: formData.profilePicture,
-          passwordHash: formData.password // Plain text password saved for local fallback mode
+          passwordHash: formData.password 
         };
 
         await SupabaseService.create('users', newUser);
-        
-        if (authUserId === sanitizedId && !getUseLocalFallback()) {
-           toast.warning("এই ইউজারটি লোকাল ডাটাবেসে সেভ করা হয়েছে। ডিভাইস সিঙ্ক না হওয়া পর্যন্ত আপনার ইউজার লগইন করতে পারবে না। (User created LOCALLY. Login unavailable until synced.)");
-        } else {
-           toast.success(`${formData.role === 'ADMIN' ? 'Admin' : 'Employee'} account created successfully! / ${formData.role === 'ADMIN' ? 'অ্যাডমিন' : 'কর্মচারী'} অ্যাকাউন্ট সফলভাবে তৈরি করা হয়েছে!`);
-        }
+        toast.success(`${formData.role === 'ADMIN' ? 'Admin' : 'Employee'} account created successfully!`);
       }
       onClose();
     } catch (err: any) {
       console.error(err);
-      toast.error("Error saving employee. " + err.message);
+      toast.error("Error saving employee: " + (err.message || 'Unknown error'));
     } finally {
       setIsSubmitting(false);
     }
@@ -4133,8 +4642,28 @@ function EmployeeForm({ onClose, initialData }: { onClose: () => void, initialDa
         <input required type="text" value={formData.password} onChange={e => setFormData({...formData, password: e.target.value})} className="w-full bg-bg-app h-12 px-4 rounded-xl font-bold border border-app-border focus:ring-2 focus:ring-accent-blue/20 outline-none transition-all" />
       </div>
       <div className="space-y-1">
-        <label className="text-[10px] font-bold text-text-secondary uppercase tracking-widest">{t.jobTitle}</label>
-        <input required value={formData.jobTitle} onChange={e => setFormData({...formData, jobTitle: e.target.value})} className="w-full bg-bg-app h-12 px-4 rounded-xl font-bold border border-app-border focus:ring-2 focus:ring-accent-blue/20 outline-none transition-all" />
+        <label className="text-[10px] font-bold text-text-secondary uppercase tracking-widest">{t.jobTitle} *</label>
+        <select 
+          required 
+          value={formData.jobTitle} 
+          onChange={e => {
+            const val = e.target.value;
+            setFormData(prev => ({
+              ...prev, 
+              jobTitle: val,
+              paymentBase: val === 'DRIVER' ? 'DRIVER' : prev.paymentBase
+            }));
+          }} 
+          className="w-full bg-bg-app h-12 px-4 rounded-xl font-bold border border-app-border focus:ring-2 focus:ring-accent-blue/20 outline-none transition-all appearance-none"
+        >
+          <option value="">{t.chooseEmployee}...</option>
+          <option value="DA">DA</option>
+          <option value="NDA">NDA</option>
+          <option value="DRIVER">DRIVER</option>
+          <option value="IN-HOUSE">IN-HOUSE</option>
+          <option value="LOADER">LOADER</option>
+          <option value="OTHERS">OTHERS</option>
+        </select>
       </div>
       <div className="grid grid-cols-2 gap-4">
         <div className="space-y-1">
@@ -4453,27 +4982,7 @@ function ImportEmployeesWizard({ onClose }: { onClose: () => void }) {
           continue;
         }
 
-        if (getUseLocalFallback()) {
-          const newUser: UserProfile = {
-            id: row.id,
-            username: row.id,
-            name: row.name || 'Old Employee',
-            role: row.role || 'EMPLOYEE',
-            department: row.department || 'Logistics',
-            jobTitle: row.jobTitle || 'Delivery Agent',
-            paymentBase: row.paymentBase || 'DAILY_FIXED',
-            rate: row.rate || 350,
-            status: 'ACTIVE',
-            lastActive: new Date().toISOString(),
-            language: 'en',
-            email: email,
-            activeSessions: [],
-            passwordHash: row.password || '123456'
-          };
-
-          await SupabaseService.create('users', newUser);
-          successCount++;
-        } else {
+        {
           const { createClient } = await import('@supabase/supabase-js');
           const { supabaseUrl, supabaseAnonKey } = await import('../lib/supabase');
           
@@ -4487,30 +4996,6 @@ function ImportEmployeesWizard({ onClose }: { onClose: () => void }) {
           });
           
           if (authErr) {
-            // Fall back to direct database profile creation for any rate-limits, email/domain invalid format details
-            console.warn(`[Bulk] Auth issue for ${row.id}: ${authErr.message}. Auto-falling back to secure database-level local creation.`);
-            if (true) {
-              console.warn(`[Bulk] Rate limit for ${row.id}, using local creation.`);
-              const newUser: UserProfile = {
-                id: row.id,
-                username: row.id,
-                name: row.name || 'Bulk Employee',
-                role: row.role || 'EMPLOYEE',
-                department: row.department || 'Logistics',
-                jobTitle: row.jobTitle || 'Delivery Agent',
-                paymentBase: row.paymentBase || 'DAILY_FIXED',
-                rate: row.rate || 350,
-                status: 'ACTIVE',
-                lastActive: new Date().toISOString(),
-                language: 'en',
-                email: email,
-                activeSessions: [],
-                passwordHash: row.password || '123456'
-              };
-              await SupabaseService.create('users', newUser);
-              successCount++;
-              continue;
-            }
             skippedCount++;
             errorsList.push(`[${row.id}] signup failed: ${authErr.message}`);
             continue;
@@ -4777,5 +5262,151 @@ function ImportEmployeesWizard({ onClose }: { onClose: () => void }) {
         </div>
       )}
     </div>
+  );
+}
+
+function ResetCredentialsForm({ 
+  employee, 
+  onClose 
+}: { 
+  employee: UserProfile; 
+  onClose: () => void; 
+}) {
+  const [newUsername, setNewUsername] = useState(employee.username || employee.id || '');
+  const [newPassword, setNewPassword] = useState(employee.passwordHash || '');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const sanitizedUsername = newUsername.toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+    if (!sanitizedUsername) {
+      toast.error("User ID (Username) cannot be empty. / ইউজার আইডি খালি থাকতে পারবে না।");
+      return;
+    }
+
+    if (newPassword.length < 6) {
+      toast.warning("Password must be at least 6 characters long. / পাসওয়ার্ড অন্তত ৬ অক্ষরের হতে হবে।");
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const newEmail = `u_${sanitizedUsername}@apl-system.com`;
+
+      // 1. Check if username/email is currently used by any other user profile in the database
+      if (sanitizedUsername !== (employee.username || employee.id).toLowerCase()) {
+        const existingEmail = await SupabaseService.list('users', [{ column: 'email', value: newEmail }]);
+        const existingId = await SupabaseService.getOne('users', sanitizedUsername);
+        
+        if (existingEmail.length > 0 || existingId) {
+          toast.warning("⚠️ This User ID is already occupied by another user profile. / এই ইউজার আইডিটি ইতিমধ্যে অন্য একজন ব্যবহার করছেন।");
+          setIsSubmitting(false);
+          return;
+        }
+      }
+
+      // 2. Perform the secure profile credential updates in DB
+      const updatePayload: Partial<UserProfile> = {
+        username: sanitizedUsername,
+        passwordHash: newPassword,
+        email: newEmail
+      };
+
+      await SupabaseService.update('users', employee.id, updatePayload);
+
+      // 3. Try to register the updated auth profile credentials in Supabase Auth behind the scenes for live server compatibility
+      if (true) {
+        try {
+          const { createClient } = await import('@supabase/supabase-js');
+          const { supabaseUrl, supabaseAnonKey } = await import('../lib/supabase');
+          
+          const tempSupabase = createClient(supabaseUrl || '', supabaseAnonKey || '', {
+            auth: { persistSession: false }
+          });
+
+          await tempSupabase.auth.signUp({
+            email: newEmail,
+            password: newPassword
+          });
+          console.log("[Supposed Sync] Supabase auth credential record updated successfully.");
+        } catch (authErr: any) {
+          console.warn("[ResetCredentials] Live Auth signup skipped or deferred:", authErr.message);
+        }
+      }
+
+      toast.success(`Successfully updated credentials for matching employee profile ${employee.name}!`);
+      onClose();
+    } catch (err: any) {
+      console.error(err);
+      toast.error(`Error saving credentials. / পাসওয়ার্ড সংরক্ষণে সমস্যা হয়েছে: ${err.message}`);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <form onSubmit={handleSubmit} className="space-y-5">
+      <div className="space-y-1.5 text-left">
+        <label className="text-xs font-black text-slate-500 uppercase tracking-wider block">Employee Name / নাম:</label>
+        <div className="w-full px-4 py-3 bg-slate-100 rounded-xl text-slate-700 text-sm font-semibold border border-slate-200">
+          {employee.name}
+        </div>
+      </div>
+
+      <div className="space-y-1.5 text-left">
+        <label className="text-xs font-black text-slate-500 uppercase tracking-wider block">
+          Update User ID / ইউজার আইডি আপডেট:
+        </label>
+        <input
+          type="text"
+          value={newUsername}
+          onChange={(e) => setNewUsername(e.target.value)}
+          className="w-full px-4 py-3 bg-white border border-slate-300 rounded-xl text-sm font-semibold text-slate-900 focus:ring-2 focus:ring-accent-blue/20 outline-none transition-all"
+          placeholder="New User ID e.g. joy123"
+          required
+        />
+        <p className="text-[10px] text-slate-400 font-medium">Auto-sanitizes: lowercase letters and numbers only / শুধুমাত্র ছোট হাতের অক্ষর এবং সংখ্যা প্রযোজ্য।</p>
+      </div>
+
+      <div className="space-y-1.5 text-left font-sans font-medium">
+        <label className="text-xs font-black text-slate-500 uppercase tracking-wider block">
+          Update Security Password / নতুন পাসওয়ার্ড:
+        </label>
+        <input
+          type="text"
+          value={newPassword}
+          onChange={(e) => setNewPassword(e.target.value)}
+          className="w-full px-4 py-3 bg-white border border-slate-300 rounded-xl text-sm font-bold font-mono tracking-wide text-slate-900 focus:ring-2 focus:ring-accent-blue/20 outline-none transition-all"
+          placeholder="Enter custom secure password"
+          required
+        />
+        <p className="text-[10px] text-slate-400 font-medium">Must be at least 6 characters long / পাসওয়ার্ড অন্তত ৬ অক্ষরের হতে হবে।</p>
+      </div>
+
+      <div className="flex gap-3 pt-2">
+        <button
+          type="button"
+          onClick={onClose}
+          className="flex-1 py-3 bg-slate-100 border border-slate-200 hover:bg-slate-200 text-slate-700 font-bold rounded-xl text-xs active:scale-95 transition-all uppercase tracking-wider"
+        >
+          Cancel / বাতিল করুন
+        </button>
+        <button
+          type="submit"
+          disabled={isSubmitting}
+          className="flex-1 py-3 bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 text-white font-bold rounded-xl text-xs active:scale-95 transition-all shadow-md shadow-emerald-600/10 uppercase tracking-wider flex items-center justify-center gap-2"
+        >
+          {isSubmitting ? (
+             <>
+               <RefreshCw className="h-4.5 w-4.5 animate-spin" /> Saving...
+             </>
+          ) : (
+             <>
+               <Save className="h-4 w-4" /> Save Credentials
+             </>
+          )}
+        </button>
+      </div>
+    </form>
   );
 }

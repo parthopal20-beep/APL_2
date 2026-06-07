@@ -6,6 +6,11 @@ export const OFFICE_LOCATIONS = [
 
 export const MAX_DISTANCE_METERS = 500;
 
+export const AUTHORIZED_PIN_CODES = [
+  '743263', '743248', '743222', '743221', 
+  '743234', '743704', '743294', '743711'
+];
+
 export function getDistanceInMeters(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const R = 6371e3; // Earth radius in meters
   const φ1 = lat1 * Math.PI / 180;

@@ -1,6 +1,6 @@
 {
   "name": "Employee Management System",
-  "description": "A comprehensive employee tracking and management system with role-based access control, attendance tracking, and live location monitoring.",
+  "description": "A comprehensive employee tracking and management system with role-based access control, attendance tracking, live location monitoring, and automated Google Sheets reporting.",
   "requestFramePermissions": [
     "camera",
     "microphone",

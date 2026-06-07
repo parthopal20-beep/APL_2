@@ -58,6 +58,7 @@ export interface AttendanceRecord {
 export interface ValueMismatch {
   id?: string;
   userId: string;
+  userName?: string;
   employeeName: string;
   date: string;
   timestamp: string;
@@ -67,6 +68,8 @@ export interface ValueMismatch {
   valueDifference: number;
   customerPhoto?: string;
   erpPhoto?: string;
+  reason?: string;
+  status?: string;
 }
 
 export interface ChatMessage {
@@ -114,6 +117,7 @@ export interface Payday {
 export interface AdHocJob {
   id?: string;
   userId: string;
+  userName?: string;
   employeeName: string;
   date: string;
   vehicleType: 'TOTO' | 'TATA ACE(107)' | 'MOTOR VAN' | 'ENGINE VAN';
@@ -123,4 +127,18 @@ export interface AdHocJob {
   value: number;
   status: 'PENDING' | 'APPROVED' | 'REJECTED';
   timestamp: string;
+}
+
+export interface CashReport {
+  id?: string;
+  userId: string;
+  userName: string;
+  date: string;
+  timestamp: string;
+  denominations: Record<string, string | number>;
+  onlineCash: number;
+  valueMismatch: number;
+  totalAmount: number;
+  totalNotes: number;
+  status: 'SUBMITTED' | 'PROCESSED';
 }
